@@ -258,16 +258,28 @@ class SessionMonitor:
                 # complete message (not streaming chunks), so every
                 # assistant entry is treated as is_complete=True.
                 best_per_msg_id: dict[str, dict] = {}
+                local_cmd_entries: list[tuple[dict, str]] = []  # (entry, cmd_name)
+                last_cmd_name: str = ""
                 for entry in new_entries:
-                    if not TranscriptParser.is_assistant_message(entry):
-                        continue
-                    message = entry.get("message", {})
-                    msg_id = message.get("id", "") if isinstance(message, dict) else ""
-                    if msg_id:
-                        best_per_msg_id[msg_id] = entry
-                    else:
-                        uuid = TranscriptParser.get_uuid(entry) or ""
-                        best_per_msg_id[f"_uuid_{uuid}"] = entry
+                    if TranscriptParser.is_assistant_message(entry):
+                        last_cmd_name = ""
+                        message = entry.get("message", {})
+                        msg_id = message.get("id", "") if isinstance(message, dict) else ""
+                        if msg_id:
+                            best_per_msg_id[msg_id] = entry
+                        else:
+                            uuid = TranscriptParser.get_uuid(entry) or ""
+                            best_per_msg_id[f"_uuid_{uuid}"] = entry
+                    elif TranscriptParser.is_user_message(entry):
+                        parsed = TranscriptParser.parse_message(entry)
+                        if not parsed:
+                            continue
+                        if parsed.message_type == "local_command_invoke":
+                            last_cmd_name = parsed.tool_name or ""
+                        elif parsed.message_type == "local_command" and parsed.text.strip():
+                            cmd = parsed.tool_name or last_cmd_name
+                            local_cmd_entries.append((entry, cmd))
+                            last_cmd_name = ""
 
                 for _, entry in best_per_msg_id.items():
                     message = entry.get("message", {})
@@ -290,6 +302,25 @@ class SessionMonitor:
                         is_complete=True,
                         msg_id=msg_id,
                         content_type=content_type,
+                    ))
+                    tracked.last_message_uuid = msg_uuid
+
+                # Emit local command stdout as messages
+                for entry, cmd_name in local_cmd_entries:
+                    parsed = TranscriptParser.parse_message(entry)
+                    if not parsed:
+                        continue
+                    msg_uuid = TranscriptParser.get_uuid(entry)
+                    if tracked.last_message_uuid == msg_uuid:
+                        continue
+                    prefix = f"❯ {cmd_name}\n" if cmd_name else ""
+                    new_messages.append(NewMessage(
+                        session_id=session_info.session_id,
+                        project_path=session_info.project_path,
+                        text=f"{prefix}{parsed.text}",
+                        uuid=msg_uuid,
+                        is_complete=True,
+                        content_type="text",
                     ))
                     tracked.last_message_uuid = msg_uuid
 

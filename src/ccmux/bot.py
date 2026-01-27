@@ -10,8 +10,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatAction
@@ -51,28 +50,24 @@ CB_SESSION_HISTORY = "sa:hist:"
 CB_SESSION_REFRESH = "sa:ref:"
 CB_SESSION_KILL = "sa:kill:"
 
-# Claude Code slash commands (no-parameter commands sent to tmux)
-CC_COMMANDS: dict[str, tuple[str, str]] = {
-    # tg_command -> (cc_slash_text, description)
-    "cc_clear": ("/clear", "Clear conversation history"),
-    "cc_compact": ("/compact", "Compact conversation context"),
-    "cc_cost": ("/cost", "Show token/cost usage"),
-    "cc_help": ("/help", "Show Claude Code help"),
-    "cc_review": ("/review", "Code review"),
-    "cc_doctor": ("/doctor", "Diagnose environment"),
-    "cc_memory": ("/memory", "Edit CLAUDE.md"),
-    "cc_init": ("/init", "Init project CLAUDE.md"),
-    "cc_login": ("/login", "Login"),
-    "cc_logout": ("/logout", "Logout"),
+# Bot's own commands — handled locally, NOT forwarded to Claude Code
+BOT_COMMANDS = {"start", "list", "history", "cancel"}
+
+# Claude Code slash commands shown in bot menu (command -> description)
+CC_COMMANDS: dict[str, str] = {
+    "clear": "Clear conversation history",
+    "compact": "Compact conversation context",
+    "cost": "Show token/cost usage",
+    "help": "Show Claude Code help",
+    "review": "Code review",
+    "doctor": "Diagnose environment",
+    "memory": "Edit CLAUDE.md",
+    "init": "Init project CLAUDE.md",
 }
 
-# Reply keyboard buttons
-BTN_NEW = "➕ New"
-BTN_PREV = "⬅️"
-BTN_NEXT = "➡️"
-
-# Sessions per page in bottom menu
-MENU_SESSIONS_PER_PAGE = 3
+# List inline callback prefixes
+CB_LIST_SELECT = "ls:sel:"
+CB_LIST_NEW = "ls:new"
 
 # Directories per page in directory browser
 DIRS_PER_PAGE = 6
@@ -88,7 +83,6 @@ STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
-PAGE_KEY = "menu_page"
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -99,42 +93,6 @@ def _truncate(text: str, max_len: int = MSG_TEXT_MAX) -> str:
     if len(text) > max_len:
         return text[:max_len] + "…"
     return text
-
-
-# --- Reply keyboard (bottom menu) ---
-
-def build_reply_keyboard(user_id: int, page: int = 0) -> ReplyKeyboardMarkup:
-    """Build persistent bottom menu with session buttons."""
-    sessions = session_manager.list_active_sessions()
-    total_pages = max(1, (len(sessions) + MENU_SESSIONS_PER_PAGE - 1) // MENU_SESSIONS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-
-    start = page * MENU_SESSIONS_PER_PAGE
-    page_sessions = sessions[start:start + MENU_SESSIONS_PER_PAGE]
-
-    active_wname = session_manager.get_active_window_name(user_id)
-
-    keyboard = []
-    for session in page_sessions:
-        # Check if this session's window matches the active one
-        w = session_manager.find_window_for_project(session.project_path)
-        is_active = w is not None and active_wname == w.window_name
-
-        icon = "📤 " if is_active else ""
-        label = f"{icon}[{session.project_name}] {session.short_summary}"
-        if len(label) > 40:
-            label = label[:37] + "..."
-        keyboard.append([KeyboardButton(label)])
-
-    nav_row = []
-    if total_pages > 1:
-        nav_row.append(KeyboardButton(BTN_PREV) if page > 0 else KeyboardButton(" "))
-        nav_row.append(KeyboardButton(f"{page + 1}/{total_pages}"))
-        nav_row.append(KeyboardButton(BTN_NEXT) if page < total_pages - 1 else KeyboardButton(" "))
-    nav_row.append(KeyboardButton(BTN_NEW))
-    keyboard.append(nav_row)
-
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 
 # --- Message history ---
@@ -208,19 +166,6 @@ async def send_history(
         await target.reply_text(text, reply_markup=keyboard)
 
 
-# --- Helpers ---
-
-def get_user_page(context: ContextTypes.DEFAULT_TYPE) -> int:
-    if context.user_data:
-        return context.user_data.get(PAGE_KEY, 0)
-    return 0
-
-
-def set_user_page(context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-    if context.user_data is not None:
-        context.user_data[PAGE_KEY] = page
-
-
 # --- Directory browser ---
 
 def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -277,35 +222,6 @@ def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, Inli
 
 # --- Command / message handlers ---
 
-async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
-    page = get_user_page(context)
-    sessions = session_manager.list_active_sessions()
-    active_wname = session_manager.get_active_window_name(user_id)
-
-    lines = [
-        "🤖 *Claude Code Monitor*\n",
-        f"📊 {len(sessions)} sessions in tmux",
-    ]
-
-    if active_wname:
-        w = tmux_manager.find_window_by_name(active_wname)
-        if w:
-            lines.append(f"📤 Active: [{Path(w.cwd).name}]")
-        else:
-            lines.append(f"📤 Active: {active_wname} (window gone)")
-    else:
-        lines.append("📤 No active session")
-
-    lines.extend(["", "Tap a session to select it.", "Send text to forward to active session."])
-
-    if update.message:
-        await update.message.reply_text(
-            "\n".join(lines),
-            reply_markup=build_reply_keyboard(user_id, page),
-            parse_mode="Markdown",
-        )
-
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -318,8 +234,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data.pop(BROWSE_PATH_KEY, None)
         context.user_data.pop(BROWSE_PAGE_KEY, None)
 
-    set_user_page(context, 0)
-    await send_main_menu(update, context, user.id)
+    if update.message:
+        # Remove any existing reply keyboard
+        await update.message.reply_text(
+            "🤖 *Claude Code Monitor*\n\n"
+            "Use /list to see sessions.\n"
+            "Send text to forward to the active session.",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="Markdown",
+        )
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -333,7 +256,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     text = update.message.text
-    page = get_user_page(context)
 
     # Ignore text in directory browsing mode
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
@@ -341,69 +263,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Please use the directory browser above, or tap Cancel."
         )
         return
-
-    # Navigation
-    if text == BTN_PREV:
-        set_user_page(context, max(0, page - 1))
-        await send_main_menu(update, context, user.id)
-        return
-    if text == BTN_NEXT:
-        sessions = session_manager.list_active_sessions()
-        total_pages = max(1, (len(sessions) + MENU_SESSIONS_PER_PAGE - 1) // MENU_SESSIONS_PER_PAGE)
-        set_user_page(context, min(total_pages - 1, page + 1))
-        await send_main_menu(update, context, user.id)
-        return
-
-    # Page indicator / placeholder
-    if "/" in text and text.replace("/", "").replace(" ", "").isdigit():
-        return
-    if text.strip() == "":
-        return
-
-    # New button
-    if text == BTN_NEW:
-        start_path = str(config.browse_root_dir)
-        if context.user_data is not None:
-            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            context.user_data[BROWSE_PATH_KEY] = start_path
-            context.user_data[BROWSE_PAGE_KEY] = 0
-        msg_text, keyboard = build_directory_browser(start_path)
-        await update.message.reply_text(msg_text, reply_markup=keyboard, parse_mode="Markdown")
-        return
-
-    # Match session button
-    sessions = session_manager.list_active_sessions()
-    for session in sessions:
-        if f"[{session.project_name}]" in text:
-            # Find the tmux window for this project
-            w = session_manager.find_window_for_project(session.project_path)
-            if w:
-                session_manager.set_active_window(user.id, w.window_name)
-
-            window_name = w.window_name if w else ""
-            detail_text = (
-                f"📤 *Selected: {session.project_name}*\n\n"
-                f"📝 {session.summary}\n"
-                f"💬 {session.message_count} messages\n\n"
-                f"Send text to forward to Claude."
-            )
-            # Inline action buttons for the session
-            action_buttons = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📋 History", callback_data=f"{CB_SESSION_HISTORY}{window_name}"[:64]),
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SESSION_REFRESH}{window_name}"[:64]),
-                InlineKeyboardButton("❌ Kill", callback_data=f"{CB_SESSION_KILL}{window_name}"[:64]),
-            ]])
-            await update.message.reply_text(
-                detail_text,
-                reply_markup=action_buttons,
-                parse_mode="Markdown",
-            )
-            # Update bottom keyboard
-            await update.message.reply_text(
-                "⌨️",
-                reply_markup=build_reply_keyboard(user.id, page),
-            )
-            return
 
     # Forward text to active window
     active_wname = session_manager.get_active_window_name(user.id)
@@ -436,7 +295,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text(
         "❌ No active session selected.\n"
-        "Tap a session button to select it, or create a new one with New."
+        "Use /list to select a session or create a new one."
     )
 
 
@@ -536,12 +395,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"✅ {message}\n\n_You can now send messages directly to this window._",
                 parse_mode="Markdown",
             )
-            pg = get_user_page(context)
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="Session list updated.",
-                reply_markup=build_reply_keyboard(user.id, pg),
-            )
         else:
             await query.edit_message_text(f"❌ {message}", parse_mode="Markdown")
         await query.answer("Created" if success else "Failed")
@@ -601,6 +454,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else:
             await query.edit_message_text("Window already gone.")
         await query.answer("Killed")
+
+    # List: select session
+    elif data.startswith(CB_LIST_SELECT):
+        wname = data[len(CB_LIST_SELECT):]
+        w = tmux_manager.find_window_by_name(wname) if wname else None
+        if w:
+            session_manager.set_active_window(user.id, w.window_name)
+            # Re-render list with updated checkmark
+            sessions = session_manager.list_active_sessions()
+            text = f"📊 {len(sessions)} active sessions:"
+            keyboard = _build_list_keyboard(user.id)
+            await query.edit_message_text(text, reply_markup=keyboard)
+            # Send session detail message
+            session = session_manager.resolve_session_for_window(w.window_name)
+            project_name = Path(w.cwd).name
+            if session:
+                detail_text = (
+                    f"📤 *Selected: {project_name}*\n\n"
+                    f"📝 {session.summary}\n"
+                    f"💬 {session.message_count} messages\n\n"
+                    f"Send text to forward to Claude."
+                )
+            else:
+                detail_text = f"📤 *Selected: {project_name}*\n\nSend text to forward to Claude."
+            action_buttons = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 History", callback_data=f"{CB_SESSION_HISTORY}{w.window_name}"[:64]),
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SESSION_REFRESH}{w.window_name}"[:64]),
+                InlineKeyboardButton("❌ Kill", callback_data=f"{CB_SESSION_KILL}{w.window_name}"[:64]),
+            ]])
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=detail_text,
+                reply_markup=action_buttons,
+                parse_mode="Markdown",
+            )
+            await query.answer(f"Active: {project_name}")
+        else:
+            await query.answer("Window no longer exists", show_alert=True)
+
+    # List: new session
+    elif data == CB_LIST_NEW:
+        start_path = str(config.browse_root_dir)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+        msg_text, keyboard = build_directory_browser(start_path)
+        await query.edit_message_text(msg_text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.answer()
 
     elif data == "noop":
         await query.answer()
@@ -702,11 +604,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     for user_id, wname in active_users:
         key = (wname, user_id)
         pending = _pending_responses.get(key)
-        reply_markup = build_reply_keyboard(user_id, page=0) if msg.is_complete else None
-
         if pending:
             if msg.is_complete:
-                # Delete the ⏳ placeholder and send final parts with reply keyboard
+                # Delete the ⏳ placeholder and send final parts
                 try:
                     await bot.delete_message(
                         chat_id=pending.chat_id,
@@ -715,14 +615,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 except Exception as e:
                     logger.debug(f"Failed to delete placeholder: {e}")
                 del _pending_responses[key]
-                for i, part in enumerate(parts):
+                for part in parts:
                     try:
-                        # Attach reply_markup to last part only
-                        markup = reply_markup if i == len(parts) - 1 else None
-                        await bot.send_message(
-                            chat_id=user_id, text=part,
-                            reply_markup=markup,
-                        )
+                        await bot.send_message(chat_id=user_id, text=part)
                     except Exception as e:
                         logger.error(f"Failed to send complete message: {e}")
             else:
@@ -740,13 +635,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         else:
             # No placeholder — send new message (unsolicited response)
             if msg.is_complete:
-                for i, part in enumerate(parts):
+                for part in parts:
                     try:
-                        markup = reply_markup if i == len(parts) - 1 else None
-                        await bot.send_message(
-                            chat_id=user_id, text=part,
-                            reply_markup=markup,
-                        )
+                        await bot.send_message(chat_id=user_id, text=part)
                     except Exception as e:
                         logger.error(f"Failed to send notification to {user_id}: {e}")
 
@@ -765,7 +656,7 @@ async def post_init(application: Application) -> None:
         BotCommand("cancel", "Cancel current operation"),
     ]
     # Add Claude Code slash commands
-    for cmd_name, (_, desc) in CC_COMMANDS.items():
+    for cmd_name, desc in CC_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
     await application.bot.set_my_commands(bot_commands)
@@ -788,23 +679,17 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Session monitor stopped")
 
 
-async def cc_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Claude Code slash commands — forward them to the active tmux session."""
+async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward any non-bot command as a slash command to the active Claude Code session."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
     if not update.message:
         return
 
-    # Extract command name (e.g. "cc_clear" from "/cc_clear")
     cmd_text = update.message.text or ""
-    cmd_name = cmd_text.lstrip("/").split("@")[0]  # strip bot mention
-
-    if cmd_name not in CC_COMMANDS:
-        await update.message.reply_text(f"Unknown command: {cmd_name}")
-        return
-
-    cc_slash, description = CC_COMMANDS[cmd_name]
+    # The full text is already a slash command like "/clear" or "/compact foo"
+    cc_slash = cmd_text.split("@")[0]  # strip bot mention
 
     active_wname = session_manager.get_active_window_name(user.id)
     if not active_wname:
@@ -831,8 +716,29 @@ async def cc_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ {message}")
 
 
+def _build_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Build inline keyboard with session buttons for /list."""
+    sessions = session_manager.list_active_sessions()
+    active_wname = session_manager.get_active_window_name(user_id)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for s in sessions:
+        w = session_manager.find_window_for_project(s.project_path)
+        is_active = w is not None and active_wname == w.window_name
+        wname = w.window_name if w else ""
+
+        check = "✅ " if is_active else ""
+        label = f"{check}[{s.project_name}] {s.short_summary}"
+        if len(label) > 40:
+            label = label[:37] + "..."
+        buttons.append([InlineKeyboardButton(label, callback_data=f"{CB_LIST_SELECT}{wname}"[:64])])
+
+    buttons.append([InlineKeyboardButton("➕ New Session", callback_data=CB_LIST_NEW)])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all active sessions."""
+    """List all active sessions as inline buttons."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
@@ -840,21 +746,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     sessions = session_manager.list_active_sessions()
-    if not sessions:
-        await update.message.reply_text("No active sessions.")
-        return
+    text = f"📊 {len(sessions)} active sessions:" if sessions else "No active sessions."
+    keyboard = _build_list_keyboard(user.id)
 
-    active_wname = session_manager.get_active_window_name(user.id)
-    lines = [f"📊 {len(sessions)} active sessions:\n"]
-    for s in sessions:
-        w = session_manager.find_window_for_project(s.project_path)
-        icon = "📤" if w and active_wname == w.window_name else "📁"
-        lines.append(f"{icon} [{s.project_name}] {s.short_summary} ({s.message_count} msgs)")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=build_reply_keyboard(user.id, get_user_page(context)),
-    )
+    await update.message.reply_text(text, reply_markup=keyboard)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -883,12 +778,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop(BROWSE_PATH_KEY, None)
         context.user_data.pop(BROWSE_PAGE_KEY, None)
 
-    page = get_user_page(context)
     if update.message:
-        await update.message.reply_text(
-            "Cancelled.",
-            reply_markup=build_reply_keyboard(user.id, page),
-        )
+        await update.message.reply_text("Cancelled.")
 
 
 def create_bot() -> Application:
@@ -904,9 +795,9 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("list", list_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
-    # Claude Code slash commands
-    application.add_handler(CommandHandler(list(CC_COMMANDS.keys()), cc_command_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    # Forward any other /command to Claude Code
+    application.add_handler(MessageHandler(filters.COMMAND, forward_command_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     return application
