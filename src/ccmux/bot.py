@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -41,7 +42,15 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
-STATUS_POLL_INTERVAL = 1.0  # seconds
+STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
+
+# Rate limiting: last send time per user to avoid Telegram flood control
+_last_send_time: dict[int, float] = {}
+MESSAGE_SEND_INTERVAL = 1.1  # seconds between messages to same user
+
+# Queue overflow protection
+MAX_QUEUE_SIZE = 5  # Drop middle messages if queue exceeds this
+QUEUE_CHECK_ENABLED = True  # Feature flag
 
 # Map (tool_use_id, user_id) -> telegram message_id for editing tool_use messages with results
 _tool_msg_ids: dict[tuple[str, int], int] = {}
@@ -52,6 +61,18 @@ _status_msg_info: dict[int, tuple[int, str] | tuple[int, str, str]] = {}
 
 # Claude Code spinner characters that indicate status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
+
+
+async def _rate_limit_send(user_id: int) -> None:
+    """Wait if necessary to avoid Telegram flood control (max 1 msg/sec per user)."""
+    now = time.time()
+    if user_id in _last_send_time:
+        elapsed = now - _last_send_time[user_id]
+        if elapsed < MESSAGE_SEND_INTERVAL:
+            wait_time = MESSAGE_SEND_INTERVAL - elapsed
+            logger.debug(f"Rate limiting: waiting {wait_time:.2f}s for user {user_id}")
+            await asyncio.sleep(wait_time)
+    _last_send_time[user_id] = time.time()
 
 
 # --- Message queue management ---
@@ -74,17 +95,149 @@ class MessageTask:
 # Per-user message queues and worker tasks
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
+_queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 
 
 def _get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
     """Get or create message queue and worker for a user."""
     if user_id not in _message_queues:
         _message_queues[user_id] = asyncio.Queue()
+        _queue_locks[user_id] = asyncio.Lock()
         # Start worker task for this user
         _queue_workers[user_id] = asyncio.create_task(
             _message_queue_worker(bot, user_id)
         )
     return _message_queues[user_id]
+
+
+def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
+    """Non-destructively inspect all items in queue.
+
+    Drains the queue and returns all items. Caller must refill.
+    """
+    items: list[MessageTask] = []
+    while not queue.empty():
+        try:
+            item = queue.get_nowait()
+            items.append(item)
+        except asyncio.QueueEmpty:
+            break
+    return items
+
+
+def _compact_queue(
+    items: list[MessageTask],
+    max_size: int,
+) -> tuple[list[MessageTask], int]:
+    """Compact queue by removing middle messages.
+
+    Strategy:
+    1. Keep first content message (context)
+    2. Keep last N messages (recency)
+    3. Drop middle content messages
+    4. Deduplicate status (keep only latest per window)
+
+    Returns: (compacted_items, num_dropped)
+    """
+    if len(items) <= max_size:
+        return items, 0
+
+    # Separate by type
+    content_msgs: list[tuple[int, MessageTask]] = []
+    status_msgs: dict[str, tuple[int, MessageTask]] = {}  # window -> (idx, task)
+
+    for i, task in enumerate(items):
+        if task.task_type == "content":
+            content_msgs.append((i, task))
+        elif task.task_type == "status_update":
+            # Keep only latest status per window
+            wname = task.window_name or ""
+            status_msgs[wname] = (i, task)
+
+    # Build compacted list
+    kept: list[tuple[int, MessageTask]] = []
+
+    # Always keep first content (context)
+    if content_msgs:
+        kept.append(content_msgs[0])
+        remaining_content = content_msgs[1:]
+    else:
+        remaining_content = []
+
+    # Keep last N items from remaining
+    remaining_items = remaining_content + list(status_msgs.values())
+    remaining_items.sort(key=lambda x: x[0])
+
+    slots_available = max_size - len(kept)
+    if slots_available > 0:
+        kept.extend(remaining_items[-slots_available:])
+
+    # Sort by original index
+    kept.sort(key=lambda x: x[0])
+
+    compacted = [task for _, task in kept]
+    num_dropped = len(items) - len(compacted)
+
+    return compacted, num_dropped
+
+
+async def _check_and_compact_queue(
+    bot: Bot,
+    user_id: int,
+    queue: asyncio.Queue[MessageTask],
+) -> None:
+    """Check queue size and compact if necessary.
+
+    Called before enqueueing. If queue > MAX_QUEUE_SIZE:
+    1. Acquire lock (prevent worker from getting while we drain)
+    2. Drain queue
+    3. Compact (keep first + last N)
+    4. Enqueue warning message at front
+    5. Refill queue
+    6. Release lock
+    """
+    if not QUEUE_CHECK_ENABLED:
+        return
+
+    current_size = queue.qsize()
+    if current_size <= MAX_QUEUE_SIZE:
+        return
+
+    logger.warning(
+        f"Queue overflow for user {user_id}: "
+        f"{current_size} messages (max {MAX_QUEUE_SIZE})"
+    )
+
+    # Acquire lock to prevent worker interference during drain/refill
+    lock = _queue_locks.get(user_id)
+    if not lock:
+        logger.error(f"No lock found for user {user_id}, skipping compact")
+        return
+
+    async with lock:
+        # Drain and compact
+        items = _inspect_queue(queue)
+        compacted, num_dropped = _compact_queue(items, MAX_QUEUE_SIZE)
+
+        # Refill queue with warning first, then compacted items
+        if num_dropped > 0:
+            warning_text = (
+                f"⚠️ 消息量过多，已丢弃 {num_dropped} 条中间消息\n\n"
+                f"（保留了最新的 {len(compacted)} 条消息）"
+            )
+            warning_task = MessageTask(
+                task_type="content",
+                text=warning_text,
+                window_name=None,
+                parts=[convert_markdown(warning_text)],
+                is_complete=True,
+            )
+            # Insert warning at front
+            queue.put_nowait(warning_task)
+
+        # Refill compacted items
+        for item in compacted:
+            queue.put_nowait(item)
 
 
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
@@ -118,14 +271,14 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     wname = task.window_name or ""
 
     # 1. Handle tool_result editing (lookup happens here to ensure sequential order)
-    if task.content_type == "tool_result" and task.tool_use_id:
+    if task.content_type == "tool_result" and task.tool_use_id and task.text:
         _tkey = (task.tool_use_id, user_id)
         edit_msg_id = _tool_msg_ids.pop(_tkey, None)
         if edit_msg_id is not None:
             # Clear status message first (tool_result edits a different message)
             # Don't remove keyboard - _check_and_send_status will send new status with keyboard
             await _do_clear_status_message(bot, user_id)
-            text_md = convert_markdown(f"{_format_response_prefix(wname, True)}\n\n{task.text}")
+            text_md = convert_markdown(task.text)
             try:
                 await bot.edit_message_text(
                     chat_id=user_id,
@@ -141,7 +294,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     await bot.edit_message_text(
                         chat_id=user_id,
                         message_id=edit_msg_id,
-                        text=f"{_format_response_prefix(wname, True)}\n\n{task.text}",
+                        text=task.text,
                     )
                     await _check_and_send_status(bot, user_id, wname)
                     return
@@ -164,6 +317,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 last_msg_id = converted_msg_id
                 continue
 
+        await _rate_limit_send(user_id)
         try:
             sent = await bot.send_message(
                 chat_id=user_id, text=part, parse_mode="MarkdownV2"
@@ -296,6 +450,7 @@ async def _do_send_status_message(
     bot: Bot, user_id: int, window_name: str, text: str
 ) -> None:
     """Send a new status message and track it (internal, called from worker)."""
+    await _rate_limit_send(user_id)
     try:
         sent = await bot.send_message(
             chat_id=user_id,
@@ -324,11 +479,11 @@ async def _do_clear_status_message(bot: Bot, user_id: int) -> None:
 
 async def _check_and_send_status(bot: Bot, user_id: int, window_name: str) -> None:
     """Check terminal for status line and send status message if present."""
-    w = tmux_manager.find_window_by_name(window_name)
+    w = await tmux_manager.find_window_by_name(window_name)
     if not w:
         return
 
-    pane_text = tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.window_id)
     if not pane_text:
         return
 
@@ -394,11 +549,11 @@ def _clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(BROWSE_PAGE_KEY, None)
 
 
-def _build_session_detail(
+async def _build_session_detail(
     window_name: str,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session detail text and action buttons for a window."""
-    session = session_manager.resolve_session_for_window(window_name)
+    session = await session_manager.resolve_session_for_window(window_name)
     if session:
         detail_text = (
             f"📤 *Selected: {window_name}*\n\n"
@@ -494,7 +649,7 @@ async def send_history(
         offset: Page index (0-based). -1 means last page.
         edit: If True, edit existing message instead of sending new one.
     """
-    messages, total = session_manager.get_recent_messages(
+    messages, total = await session_manager.get_recent_messages(
         window_name, count=0,
     )
 
@@ -633,7 +788,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Forward text to active window
     active_wname = session_manager.get_active_window_name(user.id)
     if active_wname:
-        w = tmux_manager.find_window_by_name(active_wname)
+        w = await tmux_manager.find_window_by_name(active_wname)
         if not w:
             await _safe_reply(
                 update.message,
@@ -649,7 +804,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # (otherwise it would edit the old status message above user's message)
         _status_msg_info.pop(user.id, None)
 
-        success, message = session_manager.send_to_active_session(user.id, text)
+        success, message = await session_manager.send_to_active_session(user.id, text)
         if not success:
             await _safe_reply(update.message, f"❌ {message}")
         return
@@ -684,7 +839,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        w = tmux_manager.find_window_by_name(window_name)
+        w = await tmux_manager.find_window_by_name(window_name)
         if w:
             await send_history(query, window_name, offset=offset, edit=True)
         else:
@@ -756,7 +911,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         _clear_browse_state(context.user_data)
 
-        success, message, created_wname = tmux_manager.create_window(selected_path)
+        success, message, created_wname = await tmux_manager.create_window(selected_path)
         if success:
             session_manager.set_active_window(user.id, created_wname)
 
@@ -776,7 +931,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Session action: History
     elif data.startswith(CB_SESSION_HISTORY):
         window_name = data[len(CB_SESSION_HISTORY):]
-        w = tmux_manager.find_window_by_name(window_name)
+        w = await tmux_manager.find_window_by_name(window_name)
         if w:
             await send_history(query.message, window_name)
         else:
@@ -786,16 +941,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Session action: Refresh
     elif data.startswith(CB_SESSION_REFRESH):
         window_name = data[len(CB_SESSION_REFRESH):]
-        detail_text, action_buttons = _build_session_detail(window_name)
+        detail_text, action_buttons = await _build_session_detail(window_name)
         await _safe_edit(query, detail_text, reply_markup=action_buttons)
         await query.answer("Refreshed")
 
     # Session action: Kill
     elif data.startswith(CB_SESSION_KILL):
         window_name = data[len(CB_SESSION_KILL):]
-        w = tmux_manager.find_window_by_name(window_name)
+        w = await tmux_manager.find_window_by_name(window_name)
         if w:
-            tmux_manager.kill_window(w.window_id)
+            await tmux_manager.kill_window(w.window_id)
             # Clear active session if it was this one
             if user:
                 active_wname = session_manager.get_active_window_name(user.id)
@@ -809,17 +964,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Screenshot: Refresh
     elif data.startswith(CB_SCREENSHOT_REFRESH):
         window_name = data[len(CB_SCREENSHOT_REFRESH):]
-        w = tmux_manager.find_window_by_name(window_name)
+        w = await tmux_manager.find_window_by_name(window_name)
         if not w:
             await query.answer("Window no longer exists", show_alert=True)
             return
 
-        text = tmux_manager.capture_pane(w.window_id)
+        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
         if not text:
             await query.answer("Failed to capture pane", show_alert=True)
             return
 
-        png_bytes = text_to_image(text)
+        png_bytes = await text_to_image(text, with_ansi=True)
         refresh_keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SCREENSHOT_REFRESH}{window_name}"[:64]),
         ]])
@@ -836,16 +991,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # List: select session
     elif data.startswith(CB_LIST_SELECT):
         wname = data[len(CB_LIST_SELECT):]
-        w = tmux_manager.find_window_by_name(wname) if wname else None
+        w = await tmux_manager.find_window_by_name(wname) if wname else None
         if w:
             session_manager.set_active_window(user.id, w.window_name)
             # Re-render list with updated checkmark
-            active_items = session_manager.list_active_sessions()
+            active_items = await session_manager.list_active_sessions()
             text = f"📊 {len(active_items)} active sessions:"
-            keyboard = _build_list_keyboard(user.id)
+            keyboard = await _build_list_keyboard(user.id)
             await _safe_edit(query, text, reply_markup=keyboard)
             # Send session detail message
-            detail_text, action_buttons = _build_session_detail(w.window_name)
+            detail_text, action_buttons = await _build_session_detail(w.window_name)
             await _safe_send(
                 context.bot, user.id, detail_text,
                 reply_markup=action_buttons,
@@ -877,6 +1032,7 @@ def _parse_status_line(pane_text: str) -> str | None:
 
     Returns the status text if found, None otherwise.
     Status lines start with spinner characters: · ✻ ✽ ✶ ✳ ✢
+    The spinner character is trimmed from the returned text.
     """
     if not pane_text:
         return None
@@ -891,49 +1047,106 @@ def _parse_status_line(pane_text: str) -> str | None:
         # Check if line starts with a spinner character
         first_char = line[0] if line else ""
         if first_char in STATUS_SPINNERS:
-            return line
+            # Remove the spinner character and return the rest
+            return line[1:].strip()
     return None
 
 
-def _enqueue_status_update(bot: Bot, user_id: int, window_name: str, status_text: str | None) -> None:
-    """Enqueue a status update task."""
+async def _enqueue_status_update(bot: Bot, user_id: int, window_name: str, status_text: str | None) -> None:
+    """Enqueue status update, removing old status for same window.
+
+    Status messages are ephemeral - only the latest matters.
+    Remove all pending status_update tasks for the same window.
+
+    Optimized: drain/refill only once, combining deduplication and compaction.
+    """
     queue = _get_or_create_queue(bot, user_id)
-    if status_text:
-        task = MessageTask(
-            task_type="status_update",
-            text=status_text,
-            window_name=window_name,
-        )
-    else:
-        task = MessageTask(task_type="status_clear")
-    queue.put_nowait(task)
+    lock = _queue_locks.get(user_id)
+    if not lock:
+        logger.error(f"No lock found for user {user_id}, skipping enqueue")
+        return
+
+    async with lock:
+        # Drain queue once
+        items = _inspect_queue(queue)
+
+        # 1. Remove old status messages for the same window (deduplication)
+        filtered_items: list[MessageTask] = []
+        removed_count = 0
+
+        for task in items:
+            # Remove old status_update for SAME window
+            if task.task_type == "status_update" and task.window_name == window_name:
+                removed_count += 1
+                continue
+            filtered_items.append(task)
+
+        if removed_count > 0:
+            logger.debug(f"Deduped {removed_count} stale status for user {user_id}")
+
+        # 2. Check if compaction is needed after deduplication
+        if len(filtered_items) > MAX_QUEUE_SIZE and QUEUE_CHECK_ENABLED:
+            logger.warning(
+                f"Queue overflow for user {user_id}: "
+                f"{len(filtered_items)} messages after dedup (max {MAX_QUEUE_SIZE})"
+            )
+            compacted, num_dropped = _compact_queue(filtered_items, MAX_QUEUE_SIZE)
+
+            if num_dropped > 0:
+                # Insert warning message
+                warning_text = (
+                    f"⚠️ 消息量过多，已丢弃 {num_dropped} 条中间消息\n\n"
+                    f"（保留了最新的 {len(compacted)} 条消息）"
+                )
+                warning_task = MessageTask(
+                    task_type="content",
+                    text=warning_text,
+                    window_name=None,
+                    parts=[convert_markdown(warning_text)],
+                    is_complete=True,
+                )
+                queue.put_nowait(warning_task)
+
+            filtered_items = compacted
+
+        # 3. Refill queue with filtered/compacted items
+        for item in filtered_items:
+            queue.put_nowait(item)
+
+        # 4. Enqueue new status message
+        if status_text:
+            task = MessageTask(
+                task_type="status_update",
+                text=status_text,
+                window_name=window_name,
+            )
+        else:
+            task = MessageTask(task_type="status_clear")
+
+        queue.put_nowait(task)
 
 
 async def _update_status_message(bot: Bot, user_id: int, window_name: str) -> None:
     """Poll terminal and enqueue status update for user's active window."""
-    w = tmux_manager.find_window_by_name(window_name)
+    w = await tmux_manager.find_window_by_name(window_name)
     if not w:
         # Window gone, enqueue clear
-        _enqueue_status_update(bot, user_id, window_name, None)
+        await _enqueue_status_update(bot, user_id, window_name, None)
         return
 
-    pane_text = tmux_manager.capture_pane(w.window_id)
+    pane_text = await tmux_manager.capture_pane(w.window_id)
     if not pane_text:
-        # No pane content, enqueue clear
-        _enqueue_status_update(bot, user_id, window_name, None)
+        # Transient capture failure - keep existing status message
         return
 
     status_line = _parse_status_line(pane_text)
-    current_info = _status_msg_info.get(user_id)
 
     if status_line:
-        _enqueue_status_update(bot, user_id, window_name, status_line)
-    elif current_info:
-        # No status line but we have a status message, clear it
-        _enqueue_status_update(bot, user_id, window_name, None)
+        await _enqueue_status_update(bot, user_id, window_name, status_line)
+    # If no status line, keep existing status message (don't clear on transient state)
 
 
-def _enqueue_content_message(
+async def _enqueue_content_message(
     bot: Bot,
     user_id: int,
     window_name: str,
@@ -945,6 +1158,10 @@ def _enqueue_content_message(
 ) -> None:
     """Enqueue a content message task."""
     queue = _get_or_create_queue(bot, user_id)
+
+    # Check queue size and compact if needed (async call with lock)
+    await _check_and_compact_queue(bot, user_id, queue)
+
     task = MessageTask(
         task_type="content",
         text=text,
@@ -960,17 +1177,6 @@ def _enqueue_content_message(
 # --- Streaming response / notifications ---
 
 
-def _format_response_prefix(
-    window_name: str, is_complete: bool, content_type: str = "text",
-) -> str:
-    """Return the emoji + window prefix for a response."""
-    if content_type == "thinking":
-        return f"💭 [{window_name}]"
-    if is_complete:
-        return f"🤖 [{window_name}]"
-    return f"⏳ [{window_name}]"
-
-
 def _build_response_parts(
     window_name: str, text: str, is_complete: bool,
     content_type: str = "text",
@@ -981,7 +1187,6 @@ def _build_response_parts(
     Multi-part messages get a [1/N] suffix.
     """
     text = text.strip()
-    prefix = _format_response_prefix(window_name, is_complete, content_type)
 
     # Truncate thinking content to keep it compact
     if content_type == "thinking" and is_complete:
@@ -997,26 +1202,45 @@ def _build_response_parts(
         elif len(text) > max_thinking:
             text = text[:max_thinking] + "\n\n… (thinking truncated)"
 
+    # Format based on content type
+    if content_type == "thinking":
+        # Thinking: prefix with "∴ Thinking…" and single newline
+        prefix = "∴ Thinking…"
+        separator = "\n"
+    else:
+        # Plain text: no prefix
+        prefix = ""
+        separator = ""
+
     # If text contains expandable quote sentinels, don't split —
     # the quote must stay atomic. Truncation is handled by
     # _render_expandable_quote in markdown_v2.py.
     from .transcript_parser import TranscriptParser
     if TranscriptParser.EXPANDABLE_QUOTE_START in text:
-        return [convert_markdown(f"{prefix}\n\n{text}")]
+        if prefix:
+            return [convert_markdown(f"{prefix}{separator}{text}")]
+        else:
+            return [convert_markdown(text)]
 
     # Split markdown first, then convert each chunk to HTML.
     # Use conservative max to leave room for HTML tags added by conversion.
-    max_text = 3000 - len(prefix)
+    max_text = 3000 - len(prefix) - len(separator)
 
     text_chunks = split_message(text, max_length=max_text)
     total = len(text_chunks)
 
     if total == 1:
-        return [convert_markdown(f"{prefix}\n\n{text_chunks[0]}")]
+        if prefix:
+            return [convert_markdown(f"{prefix}{separator}{text_chunks[0]}")]
+        else:
+            return [convert_markdown(text_chunks[0])]
 
     parts = []
     for i, chunk in enumerate(text_chunks, 1):
-        parts.append(convert_markdown(f"{prefix}\n\n{chunk}\n\n[{i}/{total}]"))
+        if prefix:
+            parts.append(convert_markdown(f"{prefix}{separator}{chunk}\n\n[{i}/{total}]"))
+        else:
+            parts.append(convert_markdown(f"{chunk}\n\n[{i}/{total}]"))
     return parts
 
 
@@ -1034,7 +1258,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     # Find users whose active window matches this session
     active_users: list[tuple[int, str]] = []  # (user_id, window_name)
     for uid, wname in session_manager.active_sessions.items():
-        resolved = session_manager.resolve_session_for_window(wname)
+        resolved = await session_manager.resolve_session_for_window(wname)
         if resolved and resolved.session_id == msg.session_id:
             active_users.append((uid, wname))
 
@@ -1045,7 +1269,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         )
         # Log what each active user resolves to, for debugging
         for uid, wname in session_manager.active_sessions.items():
-            resolved = session_manager.resolve_session_for_window(wname)
+            resolved = await session_manager.resolve_session_for_window(wname)
             resolved_id = resolved.session_id if resolved else None
             logger.info(
                 f"  user={uid}, window={wname} -> resolved_session={resolved_id}"
@@ -1061,7 +1285,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # Enqueue content message task
             # Note: tool_result editing is handled inside _process_content_task
             # to ensure sequential processing with tool_use message sending
-            _enqueue_content_message(
+            await _enqueue_content_message(
                 bot=bot,
                 user_id=user_id,
                 window_name=wname,
@@ -1148,6 +1372,7 @@ async def post_shutdown(application: Application) -> None:
             pass
     _queue_workers.clear()
     _message_queues.clear()
+    _queue_locks.clear()
     logger.info("Message queue workers stopped")
 
     if session_monitor:
@@ -1172,13 +1397,13 @@ async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_
         await _safe_reply(update.message, "❌ No active session. Select a session first.")
         return
 
-    w = tmux_manager.find_window_by_name(active_wname)
+    w = await tmux_manager.find_window_by_name(active_wname)
     if not w:
         await _safe_reply(update.message, f"❌ Window '{active_wname}' no longer exists.")
         return
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    success, message = session_manager.send_to_active_session(user.id, cc_slash)
+    success, message = await session_manager.send_to_active_session(user.id, cc_slash)
     if success:
         await _safe_reply(update.message, f"⚡ [{active_wname}] Sent: {cc_slash}")
         # If /clear command was sent, clear the session association
@@ -1189,9 +1414,9 @@ async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_
         await _safe_reply(update.message, f"❌ {message}")
 
 
-def _build_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
+async def _build_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Build inline keyboard with session buttons for /list."""
-    active_items = session_manager.list_active_sessions()
+    active_items = await session_manager.list_active_sessions()
     active_wname = session_manager.get_active_window_name(user_id)
 
     buttons: list[list[InlineKeyboardButton]] = []
@@ -1216,9 +1441,9 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
 
-    active_items = session_manager.list_active_sessions()
+    active_items = await session_manager.list_active_sessions()
     text = f"📊 {len(active_items)} active sessions:" if active_items else "No active sessions."
-    keyboard = _build_list_keyboard(user.id)
+    keyboard = await _build_list_keyboard(user.id)
 
     await _safe_reply(update.message, text, reply_markup=keyboard)
 
@@ -1252,17 +1477,17 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _safe_reply(update.message, "❌ No active session. Select one first.")
         return
 
-    w = tmux_manager.find_window_by_name(active_wname)
+    w = await tmux_manager.find_window_by_name(active_wname)
     if not w:
         await _safe_reply(update.message, f"❌ Window '{active_wname}' no longer exists.")
         return
 
-    text = tmux_manager.capture_pane(w.window_id)
+    text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
     if not text:
         await _safe_reply(update.message, "❌ Failed to capture pane content.")
         return
 
-    png_bytes = text_to_image(text)
+    png_bytes = await text_to_image(text, with_ansi=True)
     refresh_keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Refresh", callback_data=f"{CB_SCREENSHOT_REFRESH}{active_wname}"[:64]),
     ]])
@@ -1286,13 +1511,13 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _safe_reply(update.message, "❌ No active session. Select one first.")
         return
 
-    w = tmux_manager.find_window_by_name(active_wname)
+    w = await tmux_manager.find_window_by_name(active_wname)
     if not w:
         await _safe_reply(update.message, f"❌ Window '{active_wname}' no longer exists.")
         return
 
     # Send Escape control character (no enter)
-    tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
+    await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await _safe_reply(update.message, "⎋ Sent Escape")
 
 

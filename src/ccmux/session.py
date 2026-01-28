@@ -9,11 +9,14 @@ Each window stores:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import aiofiles
 
 from .config import config
 from .tmux_manager import TmuxWindow, tmux_manager
@@ -69,12 +72,12 @@ class ClaudeSession:
 
 
 
-def _read_user_messages_from_jsonl(file_path: str | Path) -> list[str]:
+async def _read_user_messages_from_jsonl(file_path: str | Path) -> list[str]:
     """Read all user message texts from a JSONL file, ordered chronologically."""
     messages: list[str] = []
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async for line in f:
                 data = TranscriptParser.parse_line(line)
                 if not data:
                     continue
@@ -87,12 +90,12 @@ def _read_user_messages_from_jsonl(file_path: str | Path) -> list[str]:
     return messages
 
 
-def _read_summary_from_jsonl(file_path: str | Path) -> str:
+async def _read_summary_from_jsonl(file_path: str | Path) -> str:
     """Read the latest summary entry from a JSONL file."""
     summary = ""
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async for line in f:
                 line = line.strip()
                 if not line:
                     continue
@@ -142,6 +145,7 @@ class SessionManager:
         atomic_write_json(config.state_file, state)
 
     def _load_state(self) -> None:
+        """Load state synchronously during initialization."""
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
@@ -158,12 +162,14 @@ class SessionManager:
                 self.active_sessions = {}
                 self.window_states = {}
 
-    def load_session_map(self) -> None:
+    async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations."""
         if not config.session_map_file.exists():
             return
         try:
-            session_map = json.loads(config.session_map_file.read_text())
+            async with aiofiles.open(config.session_map_file, "r") as f:
+                content = await f.read()
+            session_map = json.loads(content)
         except (json.JSONDecodeError, OSError):
             return
 
@@ -206,16 +212,17 @@ class SessionManager:
         self._save_state()
         logger.info(f"Cleared session for window {window_name}")
 
-    def _get_session_by_id(self, session_id: str) -> ClaudeSession | None:
+    async def _get_session_by_id(self, session_id: str) -> ClaudeSession | None:
         """Get a ClaudeSession by its ID."""
-        for session in self.list_all_sessions():
+        all_sessions = await self.list_all_sessions()
+        for session in all_sessions:
             if session.session_id == session_id:
                 return session
         return None
 
     # --- Session index scanning ---
 
-    def list_all_sessions(self) -> list[ClaudeSession]:
+    async def list_all_sessions(self) -> list[ClaudeSession]:
         """List all Claude Code sessions sorted by modification time (newest first)."""
         sessions: list[ClaudeSession] = []
 
@@ -231,13 +238,15 @@ class SessionManager:
                 continue
 
             try:
-                index_data = json.loads(index_file.read_text())
+                async with aiofiles.open(index_file, "r") as f:
+                    content = await f.read()
+                index_data = json.loads(content)
                 for entry in index_data.get("entries", []):
                     full_path = entry.get("fullPath", "")
-                    jsonl_summary = _read_summary_from_jsonl(full_path) if full_path else ""
+                    jsonl_summary = await _read_summary_from_jsonl(full_path) if full_path else ""
                     if not jsonl_summary and full_path:
-                        msgs = _read_user_messages_from_jsonl(full_path)
-                        jsonl_summary = msgs[-1][:50] if msgs else ""
+                        user_msgs = await _read_user_messages_from_jsonl(full_path)
+                        jsonl_summary = user_msgs[-1][:50] if user_msgs else ""
                     summary = jsonl_summary or entry.get("summary", "Untitled")
                     session = ClaudeSession(
                         session_id=entry.get("sessionId", ""),
@@ -262,7 +271,9 @@ class SessionManager:
             original_path = ""
             if index_file.exists():
                 try:
-                    original_path = json.loads(index_file.read_text()).get("originalPath", "")
+                    async with aiofiles.open(index_file, "r") as f:
+                        content = await f.read()
+                    original_path = json.loads(content).get("originalPath", "")
                 except (json.JSONDecodeError, OSError):
                     pass
 
@@ -273,16 +284,17 @@ class SessionManager:
                         continue
                     project_path = original_path
                     if not project_path:
-                        project_path = read_cwd_from_jsonl(jsonl_file)
+                        project_path = await asyncio.to_thread(read_cwd_from_jsonl, jsonl_file)
                     if not project_path:
                         dir_name = project_dir.name
                         if dir_name.startswith("-"):
                             project_path = dir_name.replace("-", "/")
-                    user_msgs = _read_user_messages_from_jsonl(jsonl_file)
-                    first_prompt = user_msgs[0] if user_msgs else ""
-                    last_prompt = user_msgs[-1] if user_msgs else ""
+                    user_messages = await _read_user_messages_from_jsonl(jsonl_file)
+                    first_prompt = user_messages[0] if user_messages else ""
+                    last_prompt = user_messages[-1] if user_messages else ""
+                    jsonl_summary_unindexed = await _read_summary_from_jsonl(jsonl_file)
                     summary = (
-                        _read_summary_from_jsonl(jsonl_file)
+                        jsonl_summary_unindexed
                         or last_prompt[:50]
                         or "(new session)"
                     )
@@ -291,7 +303,7 @@ class SessionManager:
                         summary=summary,
                         project_path=project_path,
                         first_prompt=first_prompt,
-                        message_count=len(user_msgs),
+                        message_count=len(user_messages),
                         modified="",
                         file_path=str(jsonl_file),
                     ))
@@ -301,22 +313,22 @@ class SessionManager:
         sessions.sort(key=lambda s: s.modified, reverse=True)
         return sessions
 
-    def list_active_sessions(self) -> list[tuple[TmuxWindow, ClaudeSession | None]]:
+    async def list_active_sessions(self) -> list[tuple[TmuxWindow, ClaudeSession | None]]:
         """List active tmux windows paired with their resolved sessions.
 
         Returns a list of (TmuxWindow, ClaudeSession | None) for each ccmux window.
         Multiple windows for the same directory are all included.
         """
-        windows = tmux_manager.list_windows()
+        windows = await tmux_manager.list_windows()
         result: list[tuple[TmuxWindow, ClaudeSession | None]] = []
         for w in windows:
-            session = self.resolve_session_for_window(w.window_name)
+            session = await self.resolve_session_for_window(w.window_name)
             result.append((w, session))
         return result
 
     # --- Window → Session resolution ---
 
-    def resolve_session_for_window(self, window_name: str) -> ClaudeSession | None:
+    async def resolve_session_for_window(self, window_name: str) -> ClaudeSession | None:
         """Resolve a tmux window to the best matching Claude session.
 
         Steps:
@@ -328,7 +340,7 @@ class SessionManager:
 
         # If we have a persisted session_id, use it
         if state.session_id:
-            session = self._get_session_by_id(state.session_id)
+            session = await self._get_session_by_id(state.session_id)
             if session:
                 return session
             # Session no longer exists, clear it
@@ -337,15 +349,16 @@ class SessionManager:
             self._save_state()
 
         # Fallback: find by cwd match
-        window = tmux_manager.find_window_by_name(window_name)
+        window = await tmux_manager.find_window_by_name(window_name)
         if not window:
             return None
 
         cwd = _normalize_path(window.cwd)
 
         # Find all sessions for this cwd
+        all_sessions = await self.list_all_sessions()
         candidates = [
-            s for s in self.list_all_sessions()
+            s for s in all_sessions
             if _normalize_path(s.project_path) == cwd and s.file_path
         ]
 
@@ -365,14 +378,14 @@ class SessionManager:
     def get_active_window_name(self, user_id: int) -> str | None:
         return self.active_sessions.get(user_id)
 
-    def get_active_window(self, user_id: int) -> TmuxWindow | None:
+    async def get_active_window(self, user_id: int) -> TmuxWindow | None:
         name = self.get_active_window_name(user_id)
         if not name:
             return None
-        return tmux_manager.find_window_by_name(name)
+        return await tmux_manager.find_window_by_name(name)
 
-    def get_active_cwd(self, user_id: int) -> str | None:
-        window = self.get_active_window(user_id)
+    async def get_active_cwd(self, user_id: int) -> str | None:
+        window = await self.get_active_window(user_id)
         if window:
             return _normalize_path(window.cwd)
         return None
@@ -384,25 +397,25 @@ class SessionManager:
 
     # --- Tmux helpers ---
 
-    def send_to_window(self, window_name: str, text: str) -> tuple[bool, str]:
+    async def send_to_window(self, window_name: str, text: str) -> tuple[bool, str]:
         """Send text to a tmux window by name and record for matching."""
-        window = tmux_manager.find_window_by_name(window_name)
+        window = await tmux_manager.find_window_by_name(window_name)
         if not window:
             return False, "Window not found (may have been closed)"
-        success = tmux_manager.send_keys(window.window_id, text)
+        success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {window_name}"
         return False, "Failed to send keys"
 
-    def send_to_active_session(self, user_id: int, text: str) -> tuple[bool, str]:
+    async def send_to_active_session(self, user_id: int, text: str) -> tuple[bool, str]:
         name = self.get_active_window_name(user_id)
         if not name:
             return False, "No active session selected"
-        return self.send_to_window(name, text)
+        return await self.send_to_window(name, text)
 
     # --- Message history ---
 
-    def get_recent_messages(
+    async def get_recent_messages(
         self, window_name: str, count: int = 5, offset: int = 0
     ) -> tuple[list[dict], int]:
         """Get recent user/assistant messages for a window's session.
@@ -410,7 +423,7 @@ class SessionManager:
         Resolves window → session, then reads the JSONL.
         Returns (messages, total_count).
         """
-        session = self.resolve_session_for_window(window_name)
+        session = await self.resolve_session_for_window(window_name)
         if not session or not session.file_path:
             return [], 0
 
@@ -421,8 +434,8 @@ class SessionManager:
         # Read all JSONL entries
         entries: list[dict] = []
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async for line in f:
                     data = TranscriptParser.parse_line(line)
                     if data:
                         entries.append(data)

@@ -1,6 +1,6 @@
 """Session monitoring service for Claude Code sessions.
 
-Polls Claude Code session files and detects new assistant messages.
+Uses async polling with aiofiles for non-blocking file I/O.
 Emits both intermediate (streaming) and complete messages to enable
 real-time Telegram updates.
 """
@@ -12,7 +12,9 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Awaitable
+from typing import Any, Callable, Awaitable
+
+import aiofiles
 
 from .config import config
 from .monitor_state import MonitorState, TrackedSession
@@ -50,8 +52,8 @@ class NewMessage:
 class SessionMonitor:
     """Monitors Claude Code sessions for new assistant messages.
 
-    Reads new JSONL lines immediately on mtime change (no stability wait),
-    emitting both intermediate and complete assistant messages.
+    Uses simple async polling with aiofiles for non-blocking I/O.
+    Emits both intermediate and complete assistant messages.
     """
 
     def __init__(
@@ -72,26 +74,31 @@ class SessionMonitor:
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
         # Per-session pending tool_use state carried across poll cycles
-        self._pending_tools: dict[str, dict[str, str]] = {}  # session_id -> pending
+        self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
+        # Track last known session_map for detecting changes
+        self._last_session_map: dict[str, str] = {}  # window_name -> session_id
+        # In-memory mtime cache for quick file change detection (not persisted)
+        self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
 
-    def _get_active_cwds(self) -> set[str]:
+    async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
         cwds = set()
-        for w in tmux_manager.list_windows():
+        windows = await tmux_manager.list_windows()
+        for w in windows:
             try:
                 cwds.add(str(Path(w.cwd).resolve()))
             except (OSError, ValueError):
                 cwds.add(w.cwd)
         return cwds
 
-    def scan_projects(self) -> list[SessionInfo]:
+    async def scan_projects(self) -> list[SessionInfo]:
         """Scan projects that have active tmux windows."""
-        active_cwds = self._get_active_cwds()
+        active_cwds = await self._get_active_cwds()
         if not active_cwds:
             return []
 
@@ -110,7 +117,9 @@ class SessionMonitor:
 
             if index_file.exists():
                 try:
-                    index_data = json.loads(index_file.read_text())
+                    async with aiofiles.open(index_file, "r") as f:
+                        content = await f.read()
+                    index_data = json.loads(content)
                     entries = index_data.get("entries", [])
                     original_path = index_data.get("originalPath", "")
 
@@ -153,7 +162,7 @@ class SessionMonitor:
                     # Determine project_path for this file
                     file_project_path = original_path
                     if not file_project_path:
-                        file_project_path = read_cwd_from_jsonl(jsonl_file)
+                        file_project_path = await asyncio.to_thread(read_cwd_from_jsonl, jsonl_file)
                     if not file_project_path:
                         dir_name = project_dir.name
                         if dir_name.startswith("-"):
@@ -182,73 +191,100 @@ class SessionMonitor:
 
         return sessions
 
-    def _read_new_lines(self, session: TrackedSession, file_path: Path) -> list[dict]:
-        """Read new lines from a session file.
+    async def _read_new_lines(self, session: TrackedSession, file_path: Path) -> list[dict]:
+        """Read new lines from a session file using byte offset for efficiency.
 
-        Detects file truncation (e.g. after /clear) and resets line count.
+        Detects file truncation (e.g. after /clear) and resets offset.
         """
         new_entries = []
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                # Detect file truncation: if we expect more lines than exist,
-                # reset and re-read from the beginning
-                current_total = sum(1 for _ in f)
-                f.seek(0)
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                # Get file size to detect truncation
+                await f.seek(0, 2)  # Seek to end
+                file_size = await f.tell()
 
-                if current_total < session.last_line_count:
+                # Detect file truncation: if offset is beyond file size, reset
+                if session.last_byte_offset > file_size:
                     logger.info(
                         "File truncated for session %s "
-                        "(had %d lines, now %d). Resetting.",
+                        "(offset %d > size %d). Resetting.",
                         session.session_id,
-                        session.last_line_count,
-                        current_total,
+                        session.last_byte_offset,
+                        file_size,
                     )
-                    session.last_line_count = 0
+                    session.last_byte_offset = 0
 
-                for _ in range(session.last_line_count):
-                    f.readline()
-                line_count = session.last_line_count
-                for line in f:
-                    line_count += 1
+                # Seek to last read position for incremental reading
+                await f.seek(session.last_byte_offset)
+
+                # Read only new lines from the offset
+                async for line in f:
                     data = TranscriptParser.parse_line(line)
                     if data:
                         new_entries.append(data)
-                session.last_line_count = line_count
+
+                # Update offset
+                session.last_byte_offset = await f.tell()
+
         except OSError as e:
             logger.error("Error reading session file %s: %s", file_path, e)
         return new_entries
 
-    async def check_for_updates(self) -> list[NewMessage]:
+    async def check_for_updates(self, active_session_ids: set[str]) -> list[NewMessage]:
         """Check all sessions for new assistant messages.
 
-        Reads immediately on mtime change. Emits both intermediate
+        Reads from last byte offset. Emits both intermediate
         (stop_reason=null) and complete messages.
+
+        Args:
+            active_session_ids: Set of session IDs currently in session_map
         """
         new_messages = []
-        sessions = self.scan_projects()
 
+        # Scan projects to get available session files
+        sessions = await self.scan_projects()
+
+        # Only process sessions that are in session_map
         for session_info in sessions:
+            if session_info.session_id not in active_session_ids:
+                continue
             try:
-                actual_mtime = session_info.file_path.stat().st_mtime
                 tracked = self.state.get_session(session_info.session_id)
 
                 if tracked is None:
+                    # For new sessions, initialize offset to end of file
+                    # to avoid re-processing old messages
+                    try:
+                        file_size = session_info.file_path.stat().st_size
+                        current_mtime = session_info.file_path.stat().st_mtime
+                    except OSError:
+                        file_size = 0
+                        current_mtime = 0.0
                     tracked = TrackedSession(
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
-                        last_mtime=actual_mtime,
-                        last_line_count=self._count_lines(session_info.file_path),
+                        last_byte_offset=file_size,
                         project_path=session_info.project_path,
                     )
                     self.state.update_session(tracked)
+                    self._file_mtimes[session_info.session_id] = current_mtime
                     logger.info(f"Started tracking session: {session_info.session_id}")
                     continue
 
-                if actual_mtime <= tracked.last_mtime:
+                # Check mtime to see if file has changed
+                try:
+                    current_mtime = session_info.file_path.stat().st_mtime
+                except OSError:
                     continue
 
-                # Read immediately — no stability wait
-                new_entries = self._read_new_lines(tracked, session_info.file_path)
+                last_mtime = self._file_mtimes.get(session_info.session_id, 0.0)
+                if current_mtime <= last_mtime:
+                    # File hasn't changed, skip reading
+                    continue
+
+                # File changed, read new content from last offset
+                new_entries = await self._read_new_lines(tracked, session_info.file_path)
+                self._file_mtimes[session_info.session_id] = current_mtime
 
                 if new_entries:
                     logger.debug(
@@ -279,7 +315,6 @@ class SessionMonitor:
                         tool_use_id=entry.tool_use_id,
                     ))
 
-                tracked.last_mtime = actual_mtime
                 tracked.project_path = session_info.project_path
                 self.state.update_session(tracked)
 
@@ -289,25 +324,103 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
-    def _count_lines(self, file_path: Path) -> int:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                return sum(1 for _ in f)
-        except OSError:
-            return 0
+    async def _load_current_session_map(self) -> dict[str, str]:
+        """Load current session_map and return window_name -> session_id mapping."""
+        window_to_session: dict[str, str] = {}
+        if config.session_map_file.exists():
+            try:
+                async with aiofiles.open(config.session_map_file, "r") as f:
+                    content = await f.read()
+                session_map = json.loads(content)
+                for window_name, info in session_map.items():
+                    session_id = info.get("session_id", "")
+                    if session_id:
+                        window_to_session[window_name] = session_id
+            except (json.JSONDecodeError, OSError):
+                pass
+        return window_to_session
+
+    async def _cleanup_all_stale_sessions(self) -> None:
+        """Clean up all tracked sessions not in current session_map (used on startup)."""
+        current_map = await self._load_current_session_map()
+        active_session_ids = set(current_map.values())
+
+        stale_sessions = []
+        for session_id in self.state.tracked_sessions.keys():
+            if session_id not in active_session_ids:
+                stale_sessions.append(session_id)
+
+        if stale_sessions:
+            logger.info(f"[Startup cleanup] Removing {len(stale_sessions)} stale sessions")
+            for session_id in stale_sessions:
+                self.state.remove_session(session_id)
+                self._file_mtimes.pop(session_id, None)
+            self.state.save_if_dirty()
+
+    async def _detect_and_cleanup_changes(self) -> dict[str, str]:
+        """Detect session_map changes and cleanup replaced/removed sessions.
+
+        Returns current session_map for further processing.
+        """
+        current_map = await self._load_current_session_map()
+
+        sessions_to_remove: set[str] = set()
+
+        # Check for window session changes (window exists in both, but session_id changed)
+        for window_name, old_session_id in self._last_session_map.items():
+            new_session_id = current_map.get(window_name)
+            if new_session_id and new_session_id != old_session_id:
+                logger.info(f"Window '{window_name}' session changed: {old_session_id} -> {new_session_id}")
+                sessions_to_remove.add(old_session_id)
+
+        # Check for deleted windows (window in old map but not in current)
+        old_windows = set(self._last_session_map.keys())
+        current_windows = set(current_map.keys())
+        deleted_windows = old_windows - current_windows
+
+        for window_name in deleted_windows:
+            old_session_id = self._last_session_map[window_name]
+            logger.info(f"Window '{window_name}' deleted, removing session {old_session_id}")
+            sessions_to_remove.add(old_session_id)
+
+        # Perform cleanup
+        if sessions_to_remove:
+            for session_id in sessions_to_remove:
+                self.state.remove_session(session_id)
+                self._file_mtimes.pop(session_id, None)
+            self.state.save_if_dirty()
+
+        # Update last known map
+        self._last_session_map = current_map
+
+        return current_map
 
     async def _monitor_loop(self) -> None:
+        """Background loop for checking session updates.
+
+        Uses simple async polling with aiofiles for non-blocking I/O.
+        """
         logger.info("Session monitor started, polling every %ss", self.poll_interval)
 
         # Deferred import to avoid circular dependency (cached once)
         from .session import session_manager
 
+        # Clean up all stale sessions on startup
+        await self._cleanup_all_stale_sessions()
+        # Initialize last known session_map
+        self._last_session_map = await self._load_current_session_map()
+
         while self._running:
             try:
                 # Load hook-based session map updates
-                session_manager.load_session_map()
+                await session_manager.load_session_map()
 
-                new_messages = await self.check_for_updates()
+                # Detect session_map changes and cleanup replaced/removed sessions
+                current_map = await self._detect_and_cleanup_changes()
+                active_session_ids = set(current_map.values())
+
+                # Check for new messages (all I/O is async)
+                new_messages = await self.check_for_updates(active_session_ids)
 
                 for msg in new_messages:
                     status = "complete" if msg.is_complete else "streaming"

@@ -11,10 +11,16 @@ dependencies = [
     "libtmux>=0.37.0",
     "Pillow>=10.0.0",
     "telegramify-markdown>=0.5.0",
+    "aiofiles>=24.0.0",
 ]
 
 [project.scripts]
 ccmux = "ccmux.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pyright>=1.1.0",
+]
 
 [build-system]
 requires = ["hatchling"]

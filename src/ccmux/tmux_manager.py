@@ -7,6 +7,7 @@ Only provides functionality to:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,45 +71,48 @@ class TmuxManager:
             session.windows[0].rename_window(config.tmux_main_window_name)
         return session
 
-    def list_windows(self) -> list[TmuxWindow]:
+    async def list_windows(self) -> list[TmuxWindow]:
         """List all windows in the session with their working directories.
 
         Returns:
             List of TmuxWindow with window info and cwd
         """
-        windows = []
-        session = self.get_session()
+        def _sync_list_windows() -> list[TmuxWindow]:
+            windows = []
+            session = self.get_session()
 
-        if not session:
+            if not session:
+                return windows
+
+            for window in session.windows:
+                # Only include windows with the Claude session prefix
+                name = window.window_name or ""
+                if not name.startswith(config.tmux_window_prefix):
+                    continue
+                try:
+                    # Get the active pane's current path
+                    pane = window.active_pane
+                    if pane:
+                        cwd = pane.pane_current_path or ""
+                    else:
+                        cwd = ""
+
+                    windows.append(
+                        TmuxWindow(
+                            window_id=window.window_id or "",
+                            window_name=window.window_name or "",
+                            cwd=cwd,
+                            session_name=self.session_name,
+                        )
+                    )
+                except Exception as e:
+                    logger.debug(f"Error getting window info: {e}")
+
             return windows
 
-        for window in session.windows:
-            # Only include windows with the Claude session prefix
-            name = window.window_name or ""
-            if not name.startswith(config.tmux_window_prefix):
-                continue
-            try:
-                # Get the active pane's current path
-                pane = window.active_pane
-                if pane:
-                    cwd = pane.pane_current_path or ""
-                else:
-                    cwd = ""
+        return await asyncio.to_thread(_sync_list_windows)
 
-                windows.append(
-                    TmuxWindow(
-                        window_id=window.window_id or "",
-                        window_name=window.window_name or "",
-                        cwd=cwd,
-                        session_name=self.session_name,
-                    )
-                )
-            except Exception as e:
-                logger.debug(f"Error getting window info: {e}")
-
-        return windows
-
-    def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
+    async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
 
         Args:
@@ -117,35 +121,61 @@ class TmuxManager:
         Returns:
             TmuxWindow if found, None otherwise
         """
-        for window in self.list_windows():
+        windows = await self.list_windows()
+        for window in windows:
             if window.window_name == window_name:
                 return window
         return None
 
 
-    def capture_pane(self, window_id: str) -> str | None:
+    async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
         """Capture the visible text content of a window's active pane.
+
+        Args:
+            window_id: The window ID to capture
+            with_ansi: If True, capture with ANSI color codes
 
         Returns:
             The captured text, or None on failure.
         """
-        session = self.get_session()
-        if not session:
-            return None
-        try:
-            window = session.windows.get(window_id=window_id)
-            if not window:
+        if with_ansi:
+            # Use async subprocess to call tmux capture-pane -e for ANSI colors
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "capture-pane", "-e", "-p", "-t", window_id,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    return stdout.decode("utf-8")
+                logger.error(f"Failed to capture pane {window_id}: {stderr.decode('utf-8')}")
                 return None
-            pane = window.active_pane
-            if not pane:
+            except Exception as e:
+                logger.error(f"Unexpected error capturing pane {window_id}: {e}")
                 return None
-            lines = pane.capture_pane()
-            return "\n".join(lines) if isinstance(lines, list) else str(lines)
-        except Exception as e:
-            logger.error(f"Failed to capture pane {window_id}: {e}")
-            return None
 
-    def send_keys(self, window_id: str, text: str, enter: bool = True) -> bool:
+        # Original implementation for plain text - wrap in thread
+        def _sync_capture() -> str | None:
+            session = self.get_session()
+            if not session:
+                return None
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    return None
+                pane = window.active_pane
+                if not pane:
+                    return None
+                lines = pane.capture_pane()
+                return "\n".join(lines) if isinstance(lines, list) else str(lines)
+            except Exception as e:
+                logger.error(f"Failed to capture pane {window_id}: {e}")
+                return None
+
+        return await asyncio.to_thread(_sync_capture)
+
+    async def send_keys(self, window_id: str, text: str, enter: bool = True) -> bool:
         """Send keys to a specific window.
 
         Args:
@@ -156,45 +186,51 @@ class TmuxManager:
         Returns:
             True if successful, False otherwise
         """
-        session = self.get_session()
-        if not session:
-            logger.error("No tmux session found")
-            return False
-
-        try:
-            window = session.windows.get(window_id=window_id)
-            if not window:
-                logger.error(f"Window {window_id} not found")
+        def _sync_send_keys() -> bool:
+            session = self.get_session()
+            if not session:
+                logger.error("No tmux session found")
                 return False
 
-            pane = window.active_pane
-            if not pane:
-                logger.error(f"No active pane in window {window_id}")
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    logger.error(f"Window {window_id} not found")
+                    return False
+
+                pane = window.active_pane
+                if not pane:
+                    logger.error(f"No active pane in window {window_id}")
+                    return False
+
+                pane.send_keys(text, enter=enter)
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to send keys to window {window_id}: {e}")
                 return False
 
-            pane.send_keys(text, enter=enter)
-            return True
+        return await asyncio.to_thread(_sync_send_keys)
 
-        except Exception as e:
-            logger.error(f"Failed to send keys to window {window_id}: {e}")
-            return False
-
-    def kill_window(self, window_id: str) -> bool:
+    async def kill_window(self, window_id: str) -> bool:
         """Kill a tmux window by its ID."""
-        session = self.get_session()
-        if not session:
-            return False
-        try:
-            window = session.windows.get(window_id=window_id)
-            if not window:
+        def _sync_kill() -> bool:
+            session = self.get_session()
+            if not session:
                 return False
-            window.kill()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to kill window {window_id}: {e}")
-            return False
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    return False
+                window.kill()
+                return True
+            except Exception as e:
+                logger.error(f"Failed to kill window {window_id}: {e}")
+                return False
 
-    def create_window(
+        return await asyncio.to_thread(_sync_kill)
+
+    async def create_window(
         self,
         work_dir: str,
         window_name: str | None = None,
@@ -210,9 +246,7 @@ class TmuxManager:
         Returns:
             Tuple of (success, message, window_name)
         """
-        session = self.get_or_create_session()
-
-        # Validate directory
+        # Validate directory first
         path = Path(work_dir).expanduser().resolve()
         if not path.exists():
             return False, f"Directory does not exist: {work_dir}", ""
@@ -221,34 +255,42 @@ class TmuxManager:
 
         # Create window name with prefix, adding suffix if name already exists
         if not window_name:
-            window_name = f"{config.tmux_window_prefix}{path.name}"
+            final_window_name = f"{config.tmux_window_prefix}{path.name}"
         elif not window_name.startswith(config.tmux_window_prefix):
-            window_name = f"{config.tmux_window_prefix}{window_name}"
+            final_window_name = f"{config.tmux_window_prefix}{window_name}"
+        else:
+            final_window_name = window_name
 
-        base_name = window_name
+        # Check for existing window name
+        base_name = final_window_name
         counter = 2
-        while self.find_window_by_name(window_name):
-            window_name = f"{base_name}-{counter}"
+        while await self.find_window_by_name(final_window_name):
+            final_window_name = f"{base_name}-{counter}"
             counter += 1
 
-        try:
-            # Create new window
-            window = session.new_window(
-                window_name=window_name,
-                start_directory=str(path),
-            )
+        # Create window in thread
+        def _create_and_start() -> tuple[bool, str, str]:
+            session = self.get_or_create_session()
+            try:
+                # Create new window
+                window = session.new_window(
+                    window_name=final_window_name,
+                    start_directory=str(path),
+                )
 
-            # Start Claude Code if requested
-            if start_claude:
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys(config.claude_command, enter=True)
+                # Start Claude Code if requested
+                if start_claude:
+                    pane = window.active_pane
+                    if pane:
+                        pane.send_keys(config.claude_command, enter=True)
 
-            return True, f"Created window '{window_name}' at {path}", window_name
+                return True, f"Created window '{final_window_name}' at {path}", final_window_name
 
-        except Exception as e:
-            logger.error(f"Failed to create window: {e}")
-            return False, f"Failed to create window: {e}", ""
+            except Exception as e:
+                logger.error(f"Failed to create window: {e}")
+                return False, f"Failed to create window: {e}", ""
+
+        return await asyncio.to_thread(_create_and_start)
 
 
 # Global instance with default session name

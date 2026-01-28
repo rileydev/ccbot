@@ -21,8 +21,7 @@ class TrackedSession:
 
     session_id: str
     file_path: str  # Path to .jsonl file
-    last_mtime: float  # File modification time
-    last_line_count: int  # Number of lines read
+    last_byte_offset: int = 0  # Byte offset for incremental reading
     project_path: str = ""  # Working directory
 
     def to_dict(self) -> dict[str, Any]:
@@ -35,8 +34,7 @@ class TrackedSession:
         return cls(
             session_id=data.get("session_id", ""),
             file_path=data.get("file_path", ""),
-            last_mtime=data.get("last_mtime", 0.0),
-            last_line_count=data.get("last_line_count", 0),
+            last_byte_offset=data.get("last_byte_offset", 0),
             project_path=data.get("project_path", ""),
         )
 

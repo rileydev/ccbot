@@ -26,9 +26,65 @@ Bot 的交互设计应参考 Telegram Bot 平台的最佳实践：优先使用 i
 
 所有逻辑（session 列表、消息发送、历史查看、通知等）均以 tmux window 为核心单位进行处理，而非以项目目录（cwd）为单位。同一个目录可以有多个 window（名称自动加后缀如 `cc:project-2`），每个 window 独立关联自己的 Claude session。
 
-### Hook-based session tracking
+### Telegram Flood Control 防护
 
-窗口与 Claude Code session 的关联通过 Claude Code 的 `SessionStart`/`SessionEnd` hooks 自动维护。Hook 调用 `ccmux hook` 子命令，将 window↔session 映射写入 `~/.ccmux/session_map.json`。Monitor 循环每次 poll 时读取该文件，自动更新窗口的 session 关联（检测到 session 变更时重置 `last_msg_id`）。
+Bot 实现了消息发送速率限制，避免触发 Telegram 的 flood control（频率限制）：
+- 每个用户的消息发送间隔至少 1.1 秒
+- Status 轮询间隔设为 1 秒（发送层有 rate limiting 保护）
+- 所有 `send_message` 调用都经过 `_rate_limit_send()` 检查并等待
+
+### 消息队列架构
+
+Bot 使用 per-user 消息队列 + worker 模式处理所有发送任务，确保：
+- 消息按接收顺序发送（FIFO）
+- Status 消息始终在 content 消息之后
+- 多用户并发处理互不干扰
+
+队列溢出保护（`MAX_QUEUE_SIZE = 5`）：当队列消息数超过阈值时，自动 compact：
+- 保留第一条消息（提供上下文）
+- 保留最后 N 条消息（最新内容）
+- 丢弃中间消息，并向用户发送警告
+
+### Status 消息处理
+
+Status 消息（Claude 状态行）采用特殊处理优化用户体验：
+
+**去重**：入队前移除同一 window 的旧 status 消息，确保队列中每个 window 只有一条 status。
+
+**转换**：将 status 消息编辑为第一条 content 消息，减少消息数量：
+- 有 status 消息时，第一条 content 通过 edit 更新 status 消息
+- 后续 content 作为新消息发送
+
+**轮询**：后台任务以 1 秒间隔轮询所有 active window 的终端状态，发送层的 rate limiting 确保不会触发 flood control。
+
+### Session 生命周期管理
+
+Session monitor 通过 `session_map.json`（hook 写入）追踪 window → session_id 映射：
+
+**启动清理**：Bot 启动时清理所有不在 session_map 中的 tracked session，避免监控已关闭的 session。
+
+**运行时变更检测**：每次轮询时检测 session_map 变化：
+- Window 的 session_id 改变（如执行 `/clear`）→ 清理旧 session
+- Window 被删除 → 清理对应 session
+
+### 性能优化实践
+
+**mtime 缓存**：监控循环维护内存中的文件 mtime 缓存，跳过未修改的文件读取。
+
+**Byte offset 增量读取**：每个 tracked session 记录 `last_byte_offset`，只读取新增内容。检测文件截断（offset > file_size）自动重置。
+
+**Status 去重**：入队前移除同 window 旧 status，减少队列占用和发送次数。
+
+### 多字体 Fallback
+
+截图功能使用三级字体 fallback 链确保所有字符正确显示：
+1. **JetBrains Mono** — Latin、符号、box-drawing
+2. **Noto Sans Mono CJK SC** — 中日韩字符、全角标点
+3. **Symbola** — 其他特殊符号、dingbats
+
+通过 `_font_tier()` 函数按字符 codepoint 判断使用哪级字体。支持完整的 ANSI 颜色解析（16 色 + 256 色 + RGB）。
+
+### Hook 配置
 
 用户需在 `~/.claude/settings.json` 中配置：
 

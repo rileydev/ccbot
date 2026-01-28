@@ -34,6 +34,15 @@ class ParsedEntry:
     tool_use_id: str | None = None
 
 
+@dataclass
+class PendingToolInfo:
+    """Information about a pending tool_use waiting for its tool_result."""
+
+    summary: str  # Formatted tool summary (e.g. "**Read**(file.py)")
+    tool_name: str  # Tool name (e.g. "Read", "Edit")
+    input_data: Any = None  # Tool input parameters (for Edit to generate diff)
+
+
 class TranscriptParser:
     """Parser for Claude Code JSONL session files.
 
@@ -147,10 +156,10 @@ class TranscriptParser:
             input_data: The tool input dict
 
         Returns:
-            Formatted string like "🔧 Read: /path/to/file.py"
+            Formatted string like "**Read**(file.py)"
         """
         if not isinstance(input_data, dict):
-            return f"🔧 {name}"
+            return f"**{name}**"
 
         # Pick a meaningful short summary based on tool name
         summary = ""
@@ -160,15 +169,8 @@ class TranscriptParser:
             summary = input_data.get("file_path", "")
         elif name in ("Edit", "NotebookEdit"):
             summary = input_data.get("file_path") or input_data.get("notebook_path", "")
-            # For Edit, generate diff and return early with expandable quote
-            if name == "Edit":
-                old_s = input_data.get("old_string", "")
-                new_s = input_data.get("new_string", "")
-                if old_s and new_s:
-                    diff_text = TranscriptParser._format_edit_diff(old_s, new_s)
-                    if diff_text:
-                        header = f"🔧 **{name}** `{summary}`" if summary else f"🔧 **{name}**"
-                        return header + "\n" + TranscriptParser._format_expandable_quote(diff_text)
+            # Note: Edit/Update diff and stats are generated in tool_result stage,
+            # not here. We just show the tool name and file path.
         elif name == "Bash":
             summary = input_data.get("command", "")
         elif name == "Grep":
@@ -203,8 +205,8 @@ class TranscriptParser:
         if summary:
             if len(summary) > cls._MAX_SUMMARY_LENGTH:
                 summary = summary[:cls._MAX_SUMMARY_LENGTH] + "…"
-            return f"🔧 **{name}** `{summary}`"
-        return f"🔧 **{name}**"
+            return f"**{name}**({summary})"
+        return f"**{name}**"
 
     @staticmethod
     def extract_tool_result_text(content: list | Any) -> str:
@@ -380,22 +382,76 @@ class TranscriptParser:
         return f"{cls.EXPANDABLE_QUOTE_START}{text}{cls.EXPANDABLE_QUOTE_END}"
 
     @classmethod
-    def _format_tool_result_text(cls, text: str) -> str:
-        """Format tool result text as expandable quote.
+    def _format_tool_result_text(cls, text: str, tool_name: str | None = None) -> str:
+        """Format tool result text with statistics summary.
+
+        Shows relevant statistics for each tool type, with expandable quote for full content.
 
         No truncation here — per project principles, truncation is handled
         only at the send layer (split_message / _render_expandable_quote).
         """
         if not text:
             return ""
+
+        line_count = text.count('\n') + 1 if text else 0
+
+        # Tool-specific statistics
+        if tool_name == "Read":
+            # Read: show line count instead of full content
+            return f"  ⎿  Read {line_count} lines"
+
+        elif tool_name == "Write":
+            # Write: show lines written
+            stats = f"  ⎿  Wrote {line_count} lines"
+            return stats
+
+        elif tool_name == "Bash":
+            # Bash: show output line count
+            if line_count > 0:
+                stats = f"  ⎿  Output {line_count} lines"
+                return stats + "\n" + cls._format_expandable_quote(text)
+            return cls._format_expandable_quote(text)
+
+        elif tool_name == "Grep":
+            # Grep: show match count (count non-empty lines)
+            matches = len([line for line in text.split('\n') if line.strip()])
+            stats = f"  ⎿  Found {matches} matches"
+            return stats + "\n" + cls._format_expandable_quote(text)
+
+        elif tool_name == "Glob":
+            # Glob: show file count
+            files = len([line for line in text.split('\n') if line.strip()])
+            stats = f"  ⎿  Found {files} files"
+            return stats + "\n" + cls._format_expandable_quote(text)
+
+        elif tool_name == "Task":
+            # Task: show output length
+            if line_count > 0:
+                stats = f"  ⎿  Agent output {line_count} lines"
+                return stats + "\n" + cls._format_expandable_quote(text)
+            return cls._format_expandable_quote(text)
+
+        elif tool_name == "WebFetch":
+            # WebFetch: show content length
+            char_count = len(text)
+            stats = f"  ⎿  Fetched {char_count} characters"
+            return stats + "\n" + cls._format_expandable_quote(text)
+
+        elif tool_name == "WebSearch":
+            # WebSearch: show results count (estimate by sections)
+            results = text.count('\n\n') + 1 if text else 0
+            stats = f"  ⎿  {results} search results"
+            return stats + "\n" + cls._format_expandable_quote(text)
+
+        # Default: expandable quote without stats
         return cls._format_expandable_quote(text)
 
     @classmethod
     def parse_entries(
         cls,
         entries: list[dict],
-        pending_tools: dict[str, str] | None = None,
-    ) -> tuple[list[ParsedEntry], dict[str, str]]:
+        pending_tools: dict[str, PendingToolInfo] | None = None,
+    ) -> tuple[list[ParsedEntry], dict[str, PendingToolInfo]]:
         """Parse a list of JSONL entries into a flat list of display-ready messages.
 
         This is the shared core logic used by both get_recent_messages (history)
@@ -483,7 +539,14 @@ class TranscriptParser:
                         inp = block.get("input", {})
                         summary = cls.format_tool_use_summary(name, inp)
                         if tool_id:
-                            pending_tools[tool_id] = summary
+                            # Store tool info for later tool_result formatting
+                            # Edit tool needs input_data to generate diff in tool_result stage
+                            input_data = inp if name in ("Edit", "NotebookEdit") else None
+                            pending_tools[tool_id] = PendingToolInfo(
+                                summary=summary,
+                                tool_name=name,
+                                input_data=input_data,
+                            )
                         else:
                             result.append(ParsedEntry(
                                 role="assistant", text=summary, content_type="tool_use",
@@ -519,8 +582,18 @@ class TranscriptParser:
                         result_text = cls.extract_tool_result_text(result_content)
                         is_error = block.get("is_error", False)
                         is_interrupted = result_text == cls._INTERRUPTED_TEXT
-                        tool_summary = pending_tools.pop(tool_use_id, None)
+                        tool_info = pending_tools.pop(tool_use_id, None)
                         _tuid = tool_use_id or None
+
+                        # Extract tool info from PendingToolInfo object
+                        if tool_info is None:
+                            tool_summary = None
+                            tool_name = None
+                            tool_input_data = None
+                        else:
+                            tool_summary = tool_info.summary
+                            tool_name = tool_info.tool_name
+                            tool_input_data = tool_info.input_data
 
                         if is_interrupted:
                             # Show interruption inline with tool summary
@@ -534,23 +607,45 @@ class TranscriptParser:
                                 tool_use_id=_tuid,
                             ))
                         elif is_error:
-                            # Replace 🔧 prefix with ❌ and show error text directly
+                            # Show error in stats line
                             if tool_summary:
-                                entry_text = tool_summary.replace("🔧", "❌", 1)
+                                entry_text = tool_summary
                             else:
-                                entry_text = "❌ Error"
+                                entry_text = "**Error**"
+                            # Add error message in stats format
                             if result_text:
-                                entry_text += "\n" + result_text
+                                # Take first line of error as summary
+                                error_summary = result_text.split('\n')[0]
+                                if len(error_summary) > 100:
+                                    error_summary = error_summary[:100] + "…"
+                                entry_text += f"\n  ⎿  Error: {error_summary}"
+                                # If multi-line error, add expandable quote
+                                if '\n' in result_text:
+                                    entry_text += "\n" + cls._format_expandable_quote(result_text)
+                            else:
+                                entry_text += "\n  ⎿  Error"
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
                                 tool_use_id=_tuid,
                             ))
                         elif tool_summary:
                             entry_text = tool_summary
-                            # Skip appending result text if summary already has
-                            # an expandable quote (e.g. Edit diff)
-                            if result_text and cls.EXPANDABLE_QUOTE_START not in tool_summary:
-                                entry_text += "\n" + cls._format_tool_result_text(result_text)
+                            # For Edit tool, generate diff stats and expandable quote
+                            if tool_name == "Edit" and tool_input_data and result_text:
+                                old_s = tool_input_data.get("old_string", "")
+                                new_s = tool_input_data.get("new_string", "")
+                                if old_s and new_s:
+                                    diff_text = cls._format_edit_diff(old_s, new_s)
+                                    if diff_text:
+                                        added = sum(1 for line in diff_text.split('\n')
+                                                  if line.startswith('+') and not line.startswith('+++'))
+                                        removed = sum(1 for line in diff_text.split('\n')
+                                                    if line.startswith('-') and not line.startswith('---'))
+                                        stats = f"  ⎿  Added {added} lines, removed {removed} lines"
+                                        entry_text += "\n" + stats + "\n" + cls._format_expandable_quote(diff_text)
+                            # For other tools, append formatted result text
+                            elif result_text and cls.EXPANDABLE_QUOTE_START not in tool_summary:
+                                entry_text += "\n" + cls._format_tool_result_text(result_text, tool_name)
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
                                 tool_use_id=_tuid,
@@ -558,7 +653,7 @@ class TranscriptParser:
                         elif result_text:
                             result.append(ParsedEntry(
                                 role="assistant",
-                                text=cls._format_tool_result_text(result_text),
+                                text=cls._format_tool_result_text(result_text, tool_name),
                                 content_type="tool_result",
                                 tool_use_id=_tuid,
                             ))
@@ -583,9 +678,9 @@ class TranscriptParser:
         # without emitting entries. In one-shot mode (history), emit them.
         remaining_pending = dict(pending_tools)
         if not _carry_over:
-            for tool_id, tool_summary in pending_tools.items():
+            for tool_id, tool_info in pending_tools.items():
                 result.append(ParsedEntry(
-                    role="assistant", text=tool_summary, content_type="tool_use",
+                    role="assistant", text=tool_info.summary, content_type="tool_use",
                     tool_use_id=tool_id,
                 ))
 
