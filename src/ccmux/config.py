@@ -37,10 +37,6 @@ class Config:
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
 
-        # Root directory for directory browser (default: current working directory)
-        browse_root = os.getenv("BROWSE_ROOT_DIR", "")
-        self.browse_root_dir = Path(browse_root).resolve() if browse_root else Path.cwd()
-
         # State file for persisting user subscriptions
         self.state_file = Path.home() / ".ccmux" / "state.json"
 
@@ -51,6 +47,10 @@ class Config:
 
         # Hook-based session map file
         self.session_map_file = Path.home() / ".ccmux" / "session_map.json"
+
+        # Display user messages in history and real-time notifications
+        # When True, user messages are shown with a 👤 prefix
+        self.show_user_messages = True
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""

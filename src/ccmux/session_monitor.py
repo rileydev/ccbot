@@ -37,7 +37,7 @@ class SessionInfo:
 
 @dataclass
 class NewMessage:
-    """A new assistant message detected by the monitor."""
+    """A new message detected by the monitor."""
 
     session_id: str
     project_path: str
@@ -47,6 +47,7 @@ class NewMessage:
     msg_id: str | None = None  # API message ID (same across streaming chunks)
     content_type: str = "text"  # "text" or "thinking"
     tool_use_id: str | None = None
+    role: str = "assistant"  # "user" or "assistant"
 
 
 class SessionMonitor:
@@ -303,7 +304,10 @@ class SessionMonitor:
                     self._pending_tools.pop(session_info.session_id, None)
 
                 for entry in parsed_entries:
-                    if not entry.text or entry.role == "user":
+                    if not entry.text:
+                        continue
+                    # Skip user messages unless show_user_messages is enabled
+                    if entry.role == "user" and not config.show_user_messages:
                         continue
                     new_messages.append(NewMessage(
                         session_id=session_info.session_id,
@@ -313,6 +317,7 @@ class SessionMonitor:
                         is_complete=True,
                         content_type=entry.content_type,
                         tool_use_id=entry.tool_use_id,
+                        role=entry.role,
                     ))
 
                 tracked.project_path = session_info.project_path

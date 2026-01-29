@@ -32,6 +32,7 @@ class ParsedEntry:
     text: str  # Already formatted text
     content_type: str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
     tool_use_id: str | None = None
+    timestamp: str | None = None  # ISO timestamp from JSONL
 
 
 @dataclass
@@ -481,6 +482,9 @@ class TranscriptParser:
             if msg_type not in ("user", "assistant"):
                 continue
 
+            # Extract timestamp for this entry
+            entry_timestamp = cls.get_timestamp(data)
+
             message = data.get("message")
             if not isinstance(message, dict):
                 continue
@@ -512,6 +516,7 @@ class TranscriptParser:
                         role="assistant",
                         text=formatted,
                         content_type="local_command",
+                        timestamp=entry_timestamp,
                     ))
                     last_cmd_name = None
                     continue
@@ -530,6 +535,7 @@ class TranscriptParser:
                         if t and t != cls._NO_CONTENT_PLACEHOLDER:
                             result.append(ParsedEntry(
                                 role="assistant", text=t, content_type="text",
+                                timestamp=entry_timestamp,
                             ))
                             has_text = True
 
@@ -551,6 +557,7 @@ class TranscriptParser:
                             result.append(ParsedEntry(
                                 role="assistant", text=summary, content_type="tool_use",
                                 tool_use_id=tool_id or None,
+                                timestamp=entry_timestamp,
                             ))
 
                     elif btype == "thinking":
@@ -559,10 +566,12 @@ class TranscriptParser:
                             quoted = cls._format_expandable_quote(thinking_text)
                             result.append(ParsedEntry(
                                 role="assistant", text=quoted, content_type="thinking",
+                                timestamp=entry_timestamp,
                             ))
                         elif not has_text:
                             result.append(ParsedEntry(
                                 role="assistant", text="(thinking)", content_type="thinking",
+                                timestamp=entry_timestamp,
                             ))
 
             elif msg_type == "user":
@@ -605,6 +614,7 @@ class TranscriptParser:
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
                                 tool_use_id=_tuid,
+                                timestamp=entry_timestamp,
                             ))
                         elif is_error:
                             # Show error in stats line
@@ -627,6 +637,7 @@ class TranscriptParser:
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
                                 tool_use_id=_tuid,
+                                timestamp=entry_timestamp,
                             ))
                         elif tool_summary:
                             entry_text = tool_summary
@@ -649,6 +660,7 @@ class TranscriptParser:
                             result.append(ParsedEntry(
                                 role="assistant", text=entry_text, content_type="tool_result",
                                 tool_use_id=_tuid,
+                                timestamp=entry_timestamp,
                             ))
                         elif result_text:
                             result.append(ParsedEntry(
@@ -656,6 +668,7 @@ class TranscriptParser:
                                 text=cls._format_tool_result_text(result_text, tool_name),
                                 content_type="tool_result",
                                 tool_use_id=_tuid,
+                                timestamp=entry_timestamp,
                             ))
 
                     elif btype == "text":
@@ -671,6 +684,7 @@ class TranscriptParser:
                        not cls._RE_COMMAND_NAME.search(combined):
                         result.append(ParsedEntry(
                             role="user", text=combined, content_type="text",
+                            timestamp=entry_timestamp,
                         ))
 
         # Flush remaining pending tools at end.

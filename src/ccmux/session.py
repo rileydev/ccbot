@@ -21,7 +21,7 @@ import aiofiles
 from .config import config
 from .tmux_manager import TmuxWindow, tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json, read_cwd_from_jsonl
+from .utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +32,23 @@ class WindowState:
 
     Attributes:
         session_id: Associated Claude session ID (empty if not yet detected)
+        cwd: Working directory for direct file path construction
     """
 
     session_id: str = ""
+    cwd: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
+            "cwd": self.cwd,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WindowState":
         return cls(
             session_id=data.get("session_id", ""),
+            cwd=data.get("cwd", ""),
         )
 
 
@@ -72,46 +76,6 @@ class ClaudeSession:
 
 
 
-async def _read_user_messages_from_jsonl(file_path: str | Path) -> list[str]:
-    """Read all user message texts from a JSONL file, ordered chronologically."""
-    messages: list[str] = []
-    try:
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            async for line in f:
-                data = TranscriptParser.parse_line(line)
-                if not data:
-                    continue
-                if TranscriptParser.is_user_message(data):
-                    parsed = TranscriptParser.parse_message(data)
-                    if parsed and parsed.text.strip():
-                        messages.append(parsed.text.strip())
-    except OSError as e:
-        logger.debug(f"Error reading {file_path}: {e}")
-    return messages
-
-
-async def _read_summary_from_jsonl(file_path: str | Path) -> str:
-    """Read the latest summary entry from a JSONL file."""
-    summary = ""
-    try:
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            async for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if data.get("type") == "summary":
-                        s = data.get("summary", "")
-                        if s:
-                            summary = s
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return summary
-
-
 def _normalize_path(path: str) -> str:
     try:
         return str(Path(path).resolve())
@@ -120,15 +84,27 @@ def _normalize_path(path: str) -> str:
 
 
 @dataclass
+class UnreadInfo:
+    """Information about unread messages for a user's window."""
+
+    has_unread: bool
+    start_offset: int  # User's last read offset
+    end_offset: int  # Current file size
+    file_path: str
+
+
+@dataclass
 class SessionManager:
     """Manages active sessions for Claude Code.
 
     active_sessions: user_id -> tmux window_name
     window_states: window_name -> WindowState (session_id)
+    user_window_offsets: user_id -> {window_name -> byte_offset}
     """
 
     active_sessions: dict[int, str] = field(default_factory=dict)
     window_states: dict[str, WindowState] = field(default_factory=dict)
+    user_window_offsets: dict[int, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -140,6 +116,10 @@ class SessionManager:
             },
             "window_states": {
                 k: v.to_dict() for k, v in self.window_states.items()
+            },
+            "user_window_offsets": {
+                str(uid): offsets
+                for uid, offsets in self.user_window_offsets.items()
             },
         }
         atomic_write_json(config.state_file, state)
@@ -157,10 +137,15 @@ class SessionManager:
                     k: WindowState.from_dict(v)
                     for k, v in state.get("window_states", {}).items()
                 }
+                self.user_window_offsets = {
+                    int(uid): offsets
+                    for uid, offsets in state.get("user_window_offsets", {}).items()
+                }
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning(f"Failed to load state: {e}")
                 self.active_sessions = {}
                 self.window_states = {}
+                self.user_window_offsets = {}
 
     async def load_session_map(self) -> None:
         """Read session_map.json and update window_states with new session associations."""
@@ -176,15 +161,17 @@ class SessionManager:
         changed = False
         for window_name, info in session_map.items():
             new_sid = info.get("session_id", "")
+            new_cwd = info.get("cwd", "")
             if not new_sid:
                 continue
             state = self.get_window_state(window_name)
-            if state.session_id != new_sid:
+            if state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
-                    f"Session map: window {window_name} changed "
-                    f"{state.session_id} -> {new_sid}"
+                    f"Session map: window {window_name} updated "
+                    f"sid={new_sid}, cwd={new_cwd}"
                 )
                 state.session_id = new_sid
+                state.cwd = new_cwd
                 changed = True
 
         if changed:
@@ -212,106 +199,72 @@ class SessionManager:
         self._save_state()
         logger.info(f"Cleared session for window {window_name}")
 
-    async def _get_session_by_id(self, session_id: str) -> ClaudeSession | None:
-        """Get a ClaudeSession by its ID."""
-        all_sessions = await self.list_all_sessions()
-        for session in all_sessions:
-            if session.session_id == session_id:
-                return session
-        return None
+    def _build_session_file_path(self, session_id: str, cwd: str) -> Path | None:
+        """Build the direct file path for a session from session_id and cwd."""
+        if not session_id or not cwd:
+            return None
+        # Encode cwd: /data/code/ccmux -> -data-code-ccmux
+        encoded_cwd = cwd.replace("/", "-")
+        if encoded_cwd.startswith("-"):
+            encoded_cwd = encoded_cwd  # Keep leading dash
+        return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
-    # --- Session index scanning ---
+    async def _get_session_direct(
+        self, session_id: str, cwd: str
+    ) -> ClaudeSession | None:
+        """Get a ClaudeSession directly from session_id and cwd (no scanning)."""
+        file_path = self._build_session_file_path(session_id, cwd)
 
-    async def list_all_sessions(self) -> list[ClaudeSession]:
-        """List all Claude Code sessions sorted by modification time (newest first)."""
-        sessions: list[ClaudeSession] = []
+        # Fallback: glob search if direct path doesn't exist
+        if not file_path or not file_path.exists():
+            pattern = f"*/{session_id}.jsonl"
+            matches = list(config.claude_projects_path.glob(pattern))
+            if matches:
+                file_path = matches[0]
+                logger.debug(f"Found session via glob: {file_path}")
+            else:
+                return None
 
-        if not config.claude_projects_path.exists():
-            return sessions
-
-        for project_dir in config.claude_projects_path.iterdir():
-            if not project_dir.is_dir():
-                continue
-
-            index_file = project_dir / "sessions-index.json"
-            if not index_file.exists():
-                continue
-
-            try:
-                async with aiofiles.open(index_file, "r") as f:
-                    content = await f.read()
-                index_data = json.loads(content)
-                for entry in index_data.get("entries", []):
-                    full_path = entry.get("fullPath", "")
-                    jsonl_summary = await _read_summary_from_jsonl(full_path) if full_path else ""
-                    if not jsonl_summary and full_path:
-                        user_msgs = await _read_user_messages_from_jsonl(full_path)
-                        jsonl_summary = user_msgs[-1][:50] if user_msgs else ""
-                    summary = jsonl_summary or entry.get("summary", "Untitled")
-                    session = ClaudeSession(
-                        session_id=entry.get("sessionId", ""),
-                        summary=summary,
-                        project_path=entry.get("projectPath", ""),
-                        first_prompt=entry.get("firstPrompt", ""),
-                        message_count=entry.get("messageCount", 0),
-                        modified=entry.get("modified", ""),
-                        file_path=entry.get("fullPath", ""),
-                    )
-                    if session.session_id:
-                        sessions.append(session)
-            except (json.JSONDecodeError, OSError) as e:
-                logger.debug(f"Error reading index {index_file}: {e}")
-
-        # Also pick up JSONL files not yet in any index
-        for project_dir in config.claude_projects_path.iterdir():
-            if not project_dir.is_dir():
-                continue
-            indexed_ids = {s.session_id for s in sessions}
-            index_file = project_dir / "sessions-index.json"
-            original_path = ""
-            if index_file.exists():
-                try:
-                    async with aiofiles.open(index_file, "r") as f:
-                        content = await f.read()
-                    original_path = json.loads(content).get("originalPath", "")
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-            try:
-                for jsonl_file in project_dir.glob("*.jsonl"):
-                    sid = jsonl_file.stem
-                    if sid in indexed_ids:
+        # Single pass: read file once, extract summary + count messages
+        summary = ""
+        last_user_msg = ""
+        message_count = 0
+        try:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
-                    project_path = original_path
-                    if not project_path:
-                        project_path = await asyncio.to_thread(read_cwd_from_jsonl, jsonl_file)
-                    if not project_path:
-                        dir_name = project_dir.name
-                        if dir_name.startswith("-"):
-                            project_path = dir_name.replace("-", "/")
-                    user_messages = await _read_user_messages_from_jsonl(jsonl_file)
-                    first_prompt = user_messages[0] if user_messages else ""
-                    last_prompt = user_messages[-1] if user_messages else ""
-                    jsonl_summary_unindexed = await _read_summary_from_jsonl(jsonl_file)
-                    summary = (
-                        jsonl_summary_unindexed
-                        or last_prompt[:50]
-                        or "(new session)"
-                    )
-                    sessions.append(ClaudeSession(
-                        session_id=sid,
-                        summary=summary,
-                        project_path=project_path,
-                        first_prompt=first_prompt,
-                        message_count=len(user_messages),
-                        modified="",
-                        file_path=str(jsonl_file),
-                    ))
-            except OSError:
-                pass
+                    message_count += 1
+                    try:
+                        data = json.loads(line)
+                        # Check for summary
+                        if data.get("type") == "summary":
+                            s = data.get("summary", "")
+                            if s:
+                                summary = s
+                        # Track last user message as fallback
+                        elif TranscriptParser.is_user_message(data):
+                            parsed = TranscriptParser.parse_message(data)
+                            if parsed and parsed.text.strip():
+                                last_user_msg = parsed.text.strip()
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return None
 
-        sessions.sort(key=lambda s: s.modified, reverse=True)
-        return sessions
+        if not summary:
+            summary = last_user_msg[:50] if last_user_msg else "Untitled"
+
+        return ClaudeSession(
+            session_id=session_id,
+            summary=summary,
+            project_path=cwd,
+            first_prompt="",
+            message_count=message_count,
+            modified="",
+            file_path=str(file_path),
+        )
 
     async def list_active_sessions(self) -> list[tuple[TmuxWindow, ClaudeSession | None]]:
         """List active tmux windows paired with their resolved sessions.
@@ -320,53 +273,38 @@ class SessionManager:
         Multiple windows for the same directory are all included.
         """
         windows = await tmux_manager.list_windows()
-        result: list[tuple[TmuxWindow, ClaudeSession | None]] = []
-        for w in windows:
-            session = await self.resolve_session_for_window(w.window_name)
-            result.append((w, session))
-        return result
+        # Resolve all sessions in parallel
+        sessions = await asyncio.gather(
+            *[self.resolve_session_for_window(w.window_name) for w in windows]
+        )
+        return list(zip(windows, sessions))
 
     # --- Window → Session resolution ---
 
     async def resolve_session_for_window(self, window_name: str) -> ClaudeSession | None:
         """Resolve a tmux window to the best matching Claude session.
 
-        Steps:
-        1. Check if we have a persisted session_id for this window
-        2. If yes, return that session (if it still exists)
-        3. Fallback: find by cwd match
+        Uses persisted session_id + cwd to construct file path directly.
+        Returns None if no session is associated with this window.
         """
         state = self.get_window_state(window_name)
 
-        # If we have a persisted session_id, use it
-        if state.session_id:
-            session = await self._get_session_by_id(state.session_id)
-            if session:
-                return session
-            # Session no longer exists, clear it
-            logger.warning(f"Session {state.session_id} no longer exists for window {window_name}")
-            state.session_id = ""
-            self._save_state()
-
-        # Fallback: find by cwd match
-        window = await tmux_manager.find_window_by_name(window_name)
-        if not window:
+        if not state.session_id or not state.cwd:
             return None
 
-        cwd = _normalize_path(window.cwd)
+        session = await self._get_session_direct(state.session_id, state.cwd)
+        if session:
+            return session
 
-        # Find all sessions for this cwd
-        all_sessions = await self.list_all_sessions()
-        candidates = [
-            s for s in all_sessions
-            if _normalize_path(s.project_path) == cwd and s.file_path
-        ]
-
-        if not candidates:
-            return None
-
-        # Return the most recent one
-        return candidates[0]
+        # File no longer exists, clear state
+        logger.warning(
+            f"Session file no longer exists for window {window_name} "
+            f"(sid={state.session_id}, cwd={state.cwd})"
+        )
+        state.session_id = ""
+        state.cwd = ""
+        self._save_state()
+        return None
 
     # --- Active session (by window_name) ---
 
@@ -395,6 +333,73 @@ class SessionManager:
             del self.active_sessions[user_id]
             self._save_state()
 
+    # --- User window offset management ---
+
+    def get_user_window_offset(self, user_id: int, window_name: str) -> int | None:
+        """Get the user's last read offset for a window.
+
+        Returns None if no offset has been recorded (first time).
+        """
+        user_offsets = self.user_window_offsets.get(user_id)
+        if user_offsets is None:
+            return None
+        return user_offsets.get(window_name)
+
+    def update_user_window_offset(
+        self, user_id: int, window_name: str, offset: int
+    ) -> None:
+        """Update the user's last read offset for a window."""
+        if user_id not in self.user_window_offsets:
+            self.user_window_offsets[user_id] = {}
+        self.user_window_offsets[user_id][window_name] = offset
+        self._save_state()
+
+    async def get_unread_info(
+        self, user_id: int, window_name: str
+    ) -> UnreadInfo | None:
+        """Get unread message info for a user's window.
+
+        Returns UnreadInfo if there are potentially unread messages,
+        None if the session/file cannot be resolved.
+        """
+        session = await self.resolve_session_for_window(window_name)
+        if not session or not session.file_path:
+            return None
+
+        file_path = Path(session.file_path)
+        if not file_path.exists():
+            return None
+
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            return None
+
+        user_offset = self.get_user_window_offset(user_id, window_name)
+
+        # If user has no offset, they haven't viewed this window before
+        # Initialize to current file size (no unread)
+        if user_offset is None:
+            return UnreadInfo(
+                has_unread=False,
+                start_offset=file_size,
+                end_offset=file_size,
+                file_path=str(file_path),
+            )
+
+        # Detect file truncation (e.g., after /clear)
+        if user_offset > file_size:
+            # Reset offset to 0, show all content as unread
+            user_offset = 0
+
+        has_unread = user_offset < file_size
+        return UnreadInfo(
+            has_unread=has_unread,
+            start_offset=user_offset,
+            end_offset=file_size,
+            file_path=str(file_path),
+        )
+
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_name: str, text: str) -> tuple[bool, str]:
@@ -416,11 +421,18 @@ class SessionManager:
     # --- Message history ---
 
     async def get_recent_messages(
-        self, window_name: str, count: int = 5, offset: int = 0
+        self,
+        window_name: str,
+        count: int = 5,
+        offset: int = 0,
+        *,
+        start_byte: int = 0,
+        end_byte: int | None = None,
     ) -> tuple[list[dict], int]:
-        """Get recent user/assistant messages for a window's session.
+        """Get user/assistant messages for a window's session.
 
         Resolves window → session, then reads the JSONL.
+        Supports byte range filtering via start_byte/end_byte.
         Returns (messages, total_count).
         """
         session = await self.resolve_session_for_window(window_name)
@@ -431,11 +443,24 @@ class SessionManager:
         if not file_path.exists():
             return [], 0
 
-        # Read all JSONL entries
+        # Read JSONL entries (optionally filtered by byte range)
         entries: list[dict] = []
         try:
             async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-                async for line in f:
+                if start_byte > 0:
+                    await f.seek(start_byte)
+
+                while True:
+                    # Check byte limit before reading
+                    if end_byte is not None:
+                        current_pos = await f.tell()
+                        if current_pos >= end_byte:
+                            break
+
+                    line = await f.readline()
+                    if not line:
+                        break
+
                     data = TranscriptParser.parse_line(line)
                     if data:
                         entries.append(data)
@@ -444,7 +469,15 @@ class SessionManager:
             return [], 0
 
         parsed_entries, _ = TranscriptParser.parse_entries(entries)
-        all_messages = [{"role": e.role, "text": e.text, "content_type": e.content_type} for e in parsed_entries]
+        all_messages = [
+            {
+                "role": e.role,
+                "text": e.text,
+                "content_type": e.content_type,
+                "timestamp": e.timestamp,
+            }
+            for e in parsed_entries
+        ]
 
         total = len(all_messages)
         if total == 0:

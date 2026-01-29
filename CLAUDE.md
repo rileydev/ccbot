@@ -26,6 +26,76 @@ Bot 的交互设计应参考 Telegram Bot 平台的最佳实践：优先使用 i
 
 所有逻辑（session 列表、消息发送、历史查看、通知等）均以 tmux window 为核心单位进行处理，而非以项目目录（cwd）为单位。同一个目录可以有多个 window（名称自动加后缀如 `cc:project-2`），每个 window 独立关联自己的 Claude session。
 
+### 用户、窗口、会话的关联关系
+
+系统中有三个核心实体及其映射关系：
+
+```
+┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+│   User ID   │ ───▶ │ Window Name │ ───▶ │ Session ID  │
+│  (Telegram) │      │   (tmux)    │      │  (Claude)   │
+└─────────────┘      └─────────────┘      └─────────────┘
+     active_sessions      session_map.json
+     (内存 + state.json)  (hook 写入)
+```
+
+**映射 1: User → Window（用户活跃窗口）**
+
+```python
+# session.py: SessionManager
+active_sessions: dict[int, str]  # user_id → window_name
+```
+
+- 存储位置：内存 + `~/.ccmux/state.json`
+- 写入时机：用户通过 `/list` 选择会话、创建新会话
+- 特性：**一个用户同时只有一个活跃窗口**（dict key 唯一性保证）
+- 用途：用户发消息时路由到正确的 tmux window
+
+**映射 2: Window → Session（窗口会话绑定）**
+
+```python
+# session_map.json
+{
+  "cc:project": {"session_id": "uuid-xxx", "cwd": "/path/to/project"},
+  "cc:project-2": {"session_id": "uuid-yyy", "cwd": "/path/to/project"}
+}
+```
+
+- 存储位置：`~/.ccmux/session_map.json`
+- 写入时机：Claude Code 的 `SessionStart` hook 触发时
+- 特性：一个 window 对应一个 session；`/clear` 后 session_id 会变化
+- 用途：SessionMonitor 根据此映射决定监控哪些 session
+
+**消息发送流程**
+
+```
+用户发消息 "hello"
+    │
+    ▼
+active_sessions[user_id] → "cc:project"  (获取活跃窗口)
+    │
+    ▼
+send_to_window("cc:project", "hello")    (发送到 tmux)
+```
+
+**消息接收流程**
+
+```
+SessionMonitor 读取到新消息 (session_id = "uuid-xxx")
+    │
+    ▼
+遍历 active_sessions，找到 window 对应此 session 的用户
+    │
+    ▼
+session_map["cc:project"].session_id == "uuid-xxx" ?
+    │
+    ▼
+如果用户的 active_window 是 "cc:project"，发送消息给该用户
+否则丢弃（用户已切换到其他窗口）
+```
+
+**已知限制**：消息发送只看当前 active_window。用户切换窗口期间，旧窗口产生的消息会被 SessionMonitor 正常读取（offset 移动），但因 active_window 不匹配而不发送给用户。切换回来后，这些消息不会补发（已被读取过，offset 已移动）。
+
 ### Telegram Flood Control 防护
 
 Bot 实现了消息发送速率限制，避免触发 Telegram 的 flood control（频率限制）：

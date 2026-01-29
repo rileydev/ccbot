@@ -535,6 +535,7 @@ STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
+BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -547,6 +548,7 @@ def _clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(BROWSE_PATH_KEY, None)
         user_data.pop(BROWSE_PAGE_KEY, None)
+        user_data.pop(BROWSE_DIRS_KEY, None)
 
 
 async def _build_session_detail(
@@ -614,87 +616,187 @@ async def _safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
 # --- Message history ---
 
 def _build_history_keyboard(
-    window_name: str, page_index: int, total_pages: int
+    window_name: str,
+    page_index: int,
+    total_pages: int,
+    start_byte: int = 0,
+    end_byte: int = 0,
 ) -> InlineKeyboardMarkup | None:
-    """Build inline keyboard for history pagination."""
+    """Build inline keyboard for history pagination.
+
+    Callback format: hp:<page>:<window>:<start>:<end> or hn:<page>:<window>:<start>:<end>
+    When start=0 and end=0, it means full history (no byte range filter).
+    """
     if total_pages <= 1:
         return None
 
     buttons = []
     if page_index > 0:
+        cb_data = f"{CB_HISTORY_PREV}{page_index - 1}:{window_name}:{start_byte}:{end_byte}"
         buttons.append(InlineKeyboardButton(
             "◀ Older",
-            callback_data=f"{CB_HISTORY_PREV}{page_index - 1}:{window_name}"[:64],
+            callback_data=cb_data[:64],
         ))
 
     buttons.append(InlineKeyboardButton(f"{page_index + 1}/{total_pages}", callback_data="noop"))
 
     if page_index < total_pages - 1:
+        cb_data = f"{CB_HISTORY_NEXT}{page_index + 1}:{window_name}:{start_byte}:{end_byte}"
         buttons.append(InlineKeyboardButton(
             "Newer ▶",
-            callback_data=f"{CB_HISTORY_NEXT}{page_index + 1}:{window_name}"[:64],
+            callback_data=cb_data[:64],
         ))
 
     return InlineKeyboardMarkup([buttons])
 
 
 async def send_history(
-    target, window_name: str, offset: int = -1, edit: bool = False
+    target,
+    window_name: str,
+    offset: int = -1,
+    edit: bool = False,
+    *,
+    start_byte: int = 0,
+    end_byte: int = 0,
+    user_id: int | None = None,
+    bot: Bot | None = None,
 ) -> None:
     """Send or edit message history for a window's session.
 
     Args:
         target: Message object (for reply) or CallbackQuery (for edit).
         window_name: Tmux window name (resolved to session via sent messages).
-        offset: Page index (0-based). -1 means last page.
+        offset: Page index (0-based). -1 means last page (for full history)
+                or first page (for unread range).
         edit: If True, edit existing message instead of sending new one.
+        start_byte: Start byte offset (0 = from beginning).
+        end_byte: End byte offset (0 = to end of file).
+        user_id: User ID for updating read offset (required for unread mode).
+        bot: Bot instance for direct send mode (when edit=False and bot is provided).
     """
+    # Determine if this is unread mode (specific byte range)
+    is_unread = start_byte > 0 or end_byte > 0
+
     messages, total = await session_manager.get_recent_messages(
-        window_name, count=0,
+        window_name,
+        count=0,
+        start_byte=start_byte,
+        end_byte=end_byte if end_byte > 0 else None,
     )
 
     if total == 0:
-        text = f"📋 [{window_name}] No messages yet."
+        if is_unread:
+            text = f"📬 [{window_name}] No unread messages."
+        else:
+            text = f"📋 [{window_name}] No messages yet."
         keyboard = None
     else:
         from .transcript_parser import TranscriptParser
         _start = TranscriptParser.EXPANDABLE_QUOTE_START
         _end = TranscriptParser.EXPANDABLE_QUOTE_END
 
-        lines = [f"📋 [{window_name}] Messages ({total} total)\n"]
-        for msg in messages:
-            if msg["role"] == "user":
-                icon = "👤"
-            elif msg.get("content_type") == "thinking":
-                icon = "💭"
+        # Filter messages based on config
+        if config.show_user_messages:
+            # Keep both user and assistant messages
+            pass
+        else:
+            # Filter to assistant messages only
+            messages = [m for m in messages if m["role"] == "assistant"]
+        total = len(messages)
+        if total == 0:
+            if is_unread:
+                text = f"📬 [{window_name}] No unread messages."
             else:
-                icon = "🤖"
+                text = f"📋 [{window_name}] No messages yet."
+            keyboard = None
+            if edit:
+                await _safe_edit(target, text, reply_markup=keyboard)
+            elif bot is not None and user_id is not None:
+                await _safe_send(bot, user_id, text, reply_markup=keyboard)
+            else:
+                await _safe_reply(target, text, reply_markup=keyboard)
+            # Update offset even if no assistant messages
+            if user_id is not None and end_byte > 0:
+                session_manager.update_user_window_offset(user_id, window_name, end_byte)
+            return
+
+        if is_unread:
+            header = f"📬 [{window_name}] {total} unread messages"
+        else:
+            header = f"📋 [{window_name}] Messages ({total} total)"
+
+        lines = [header]
+        for msg in messages:
+            # Format timestamp as HH:MM
+            ts = msg.get("timestamp")
+            if ts:
+                try:
+                    # ISO format: 2024-01-15T14:32:00.000Z
+                    time_part = ts.split("T")[1] if "T" in ts else ts
+                    hh_mm = time_part[:5]  # "14:32"
+                except (IndexError, TypeError):
+                    hh_mm = ""
+            else:
+                hh_mm = ""
+
+            # Add separator with time
+            if hh_mm:
+                lines.append(f"───── {hh_mm} ─────")
+            else:
+                lines.append("─────────────")
+
+            # Format message content
             msg_text = msg["text"]
-            # Strip expandable quote sentinels for history view —
-            # content is shown inline, not as collapsed blocks.
+            content_type = msg.get("content_type", "text")
+            msg_role = msg.get("role", "assistant")
+
+            # Strip expandable quote sentinels for history view
             msg_text = msg_text.replace(_start, "").replace(_end, "")
-            lines.append(f"{icon} {msg_text}")
+
+            # Add prefix based on role/type
+            if msg_role == "user":
+                # User message with emoji prefix (no newline)
+                lines.append(f"👤 {msg_text}")
+            elif content_type == "thinking":
+                # Thinking prefix to match real-time format
+                lines.append(f"∴ Thinking…\n{msg_text}")
+            else:
+                lines.append(msg_text)
         full_text = "\n\n".join(lines)
         pages = split_message(full_text, max_length=4096)
-        # Default to last page (newest messages), navigate backwards
+
+        # Default to last page (newest messages) for both history and unread
         if offset < 0:
             offset = len(pages) - 1
         page_index = max(0, min(offset, len(pages) - 1))
         text = pages[page_index]
-        keyboard = _build_history_keyboard(window_name, page_index, len(pages))
+        keyboard = _build_history_keyboard(
+            window_name, page_index, len(pages), start_byte, end_byte
+        )
 
     if edit:
         await _safe_edit(target, text, reply_markup=keyboard)
+    elif bot is not None and user_id is not None:
+        # Direct send mode (for unread catch-up after window switch)
+        await _safe_send(bot, user_id, text, reply_markup=keyboard)
     else:
         await _safe_reply(target, text, reply_markup=keyboard)
+
+    # Update user's read offset after viewing unread
+    if is_unread and user_id is not None and end_byte > 0:
+        session_manager.update_user_window_offset(user_id, window_name, end_byte)
 
 
 # --- Directory browser ---
 
-def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup, list[str]]:
+    """Build directory browser UI.
+
+    Returns: (text, keyboard, subdirs) where subdirs is the full list for caching.
+    """
     path = Path(current_path).expanduser().resolve()
     if not path.exists() or not path.is_dir():
-        path = config.browse_root_dir
+        path = Path.cwd()
 
     try:
         subdirs = sorted([
@@ -712,9 +814,11 @@ def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, Inli
     buttons: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(page_dirs), 2):
         row = []
-        for name in page_dirs[i:i+2]:
+        for j, name in enumerate(page_dirs[i:i+2]):
             display = name[:12] + "…" if len(name) > 13 else name
-            row.append(InlineKeyboardButton(f"📁 {display}", callback_data=f"{CB_DIR_SELECT}{name}"))
+            # Use global index (start + i + j) to avoid long dir names in callback_data
+            idx = start + i + j
+            row.append(InlineKeyboardButton(f"📁 {display}", callback_data=f"{CB_DIR_SELECT}{idx}"))
         buttons.append(row)
 
     if total_pages > 1:
@@ -727,9 +831,9 @@ def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, Inli
         buttons.append(nav)
 
     action_row: list[InlineKeyboardButton] = []
-    browse_root = config.browse_root_dir.resolve()
-    if path != path.parent and path != browse_root:
-        action_row.append(InlineKeyboardButton("Up", callback_data=CB_DIR_UP))
+    # Allow going up unless at filesystem root
+    if path != path.parent:
+        action_row.append(InlineKeyboardButton("..", callback_data=CB_DIR_UP))
     action_row.append(InlineKeyboardButton("Select", callback_data=CB_DIR_CONFIRM))
     action_row.append(InlineKeyboardButton("Cancel", callback_data=CB_DIR_CANCEL))
     buttons.append(action_row)
@@ -740,7 +844,7 @@ def build_directory_browser(current_path: str, page: int = 0) -> tuple[str, Inli
     else:
         text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
 
-    return text, InlineKeyboardMarkup(buttons)
+    return text, InlineKeyboardMarkup(buttons), subdirs
 
 
 # --- Command / message handlers ---
@@ -828,36 +932,63 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     data = query.data
 
-    # History: older
+    # History: older/newer pagination
+    # Format: hp:<page>:<window>:<start>:<end> or hn:<page>:<window>:<start>:<end>
     if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
         prefix_len = len(CB_HISTORY_PREV)  # same length for both
         rest = data[prefix_len:]
         try:
-            offset_str, window_name = rest.split(":", 1)
+            parts = rest.split(":")
+            if len(parts) < 4:
+                # Old format without byte range: page:window
+                offset_str, window_name = rest.split(":", 1)
+                start_byte, end_byte = 0, 0
+            else:
+                # New format: page:window:start:end (window may contain colons)
+                offset_str = parts[0]
+                start_byte = int(parts[-2])
+                end_byte = int(parts[-1])
+                window_name = ":".join(parts[1:-2])
             offset = int(offset_str)
-        except ValueError:
+        except (ValueError, IndexError):
             await query.answer("Invalid data")
             return
 
         w = await tmux_manager.find_window_by_name(window_name)
         if w:
-            await send_history(query, window_name, offset=offset, edit=True)
+            await send_history(
+                query,
+                window_name,
+                offset=offset,
+                edit=True,
+                start_byte=start_byte,
+                end_byte=end_byte,
+                # Don't pass user_id for pagination - offset update only on initial view
+                # This prevents offset from going backwards if new messages arrive while paging
+            )
         else:
             await _safe_edit(query, "Window no longer exists.")
         await query.answer("Page updated")
 
     # Directory browser handlers
     elif data.startswith(CB_DIR_SELECT):
-        subdir_name = data[len(CB_DIR_SELECT):]
-        default_path = str(config.browse_root_dir)
+        # callback_data contains index, not dir name (to avoid 64-byte limit)
+        try:
+            idx = int(data[len(CB_DIR_SELECT):])
+        except ValueError:
+            await query.answer("Invalid data")
+            return
+
+        # Look up dir name from cached subdirs
+        cached_dirs: list[str] = context.user_data.get(BROWSE_DIRS_KEY, []) if context.user_data else []
+        if idx < 0 or idx >= len(cached_dirs):
+            await query.answer("Directory list changed, please refresh", show_alert=True)
+            return
+        subdir_name = cached_dirs[idx]
+
+        default_path = str(Path.cwd())
         current_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
         new_path = (Path(current_path) / subdir_name).resolve()
-
-        # Validate: must be within browse_root_dir (prevent path traversal)
-        browse_root = config.browse_root_dir.resolve()
-        if not (str(new_path).startswith(str(browse_root) + "/") or new_path == browse_root):
-            await query.answer("Access denied", show_alert=True)
-            return
 
         if not new_path.exists() or not new_path.is_dir():
             await query.answer("Directory not found", show_alert=True)
@@ -868,25 +999,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data[BROWSE_PATH_KEY] = new_path_str
             context.user_data[BROWSE_PAGE_KEY] = 0
 
-        msg_text, keyboard = build_directory_browser(new_path_str)
+        msg_text, keyboard, subdirs = build_directory_browser(new_path_str)
+        if context.user_data is not None:
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
         await _safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_UP:
-        default_path = str(config.browse_root_dir)
+        default_path = str(Path.cwd())
         current_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
         current = Path(current_path).resolve()
         parent = current.parent
-        root = config.browse_root_dir.resolve()
-        if not str(parent).startswith(str(root)) and parent != root:
-            parent = root
+        # No restriction - allow navigating anywhere
 
         parent_path = str(parent)
         if context.user_data is not None:
             context.user_data[BROWSE_PATH_KEY] = parent_path
             context.user_data[BROWSE_PAGE_KEY] = 0
 
-        msg_text, keyboard = build_directory_browser(parent_path)
+        msg_text, keyboard, subdirs = build_directory_browser(parent_path)
+        if context.user_data is not None:
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
         await _safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
@@ -896,17 +1029,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except ValueError:
             await query.answer("Invalid data")
             return
-        default_path = str(config.browse_root_dir)
+        default_path = str(Path.cwd())
         current_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
         if context.user_data is not None:
             context.user_data[BROWSE_PAGE_KEY] = pg
 
-        msg_text, keyboard = build_directory_browser(current_path, pg)
+        msg_text, keyboard, subdirs = build_directory_browser(current_path, pg)
+        if context.user_data is not None:
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
         await _safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
     elif data == CB_DIR_CONFIRM:
-        default_path = str(config.browse_root_dir)
+        default_path = str(Path.cwd())
         selected_path = context.user_data.get(BROWSE_PATH_KEY, default_path) if context.user_data else default_path
 
         _clear_browse_state(context.user_data)
@@ -915,8 +1050,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if success:
             session_manager.set_active_window(user.id, created_wname)
 
-            await _safe_edit(
-                query,
+            # Update the directory browser message to show refreshed session list
+            active_items = await session_manager.list_active_sessions()
+            list_text = f"📊 {len(active_items)} active sessions:"
+            keyboard = await _build_list_keyboard(user.id)
+            await _safe_edit(query, list_text, reply_markup=keyboard)
+
+            # Send creation success as a new message
+            await _safe_send(
+                context.bot, user.id,
                 f"✅ {message}\n\n_You can now send messages directly to this window._",
             )
         else:
@@ -993,30 +1135,67 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         wname = data[len(CB_LIST_SELECT):]
         w = await tmux_manager.find_window_by_name(wname) if wname else None
         if w:
-            session_manager.set_active_window(user.id, w.window_name)
-            # Re-render list with updated checkmark
+            # Step 1: Clear active window to prevent message interleaving
+            # During unread catch-up, we don't want new messages from either
+            # old or new window to be sent (they would interleave with unread)
+            session_manager.clear_active_session(user.id)
+
+            # Step 2: Send UI feedback
+            # Re-render list with checkmark on new window
             active_items = await session_manager.list_active_sessions()
             text = f"📊 {len(active_items)} active sessions:"
-            keyboard = await _build_list_keyboard(user.id)
+            keyboard = await _build_list_keyboard(user.id, pending_selection=w.window_name)
             await _safe_edit(query, text, reply_markup=keyboard)
+
             # Send session detail message
             detail_text, action_buttons = await _build_session_detail(w.window_name)
             await _safe_send(
                 context.bot, user.id, detail_text,
                 reply_markup=action_buttons,
             )
+
+            # Step 3: Send unread catch-up (if any)
+            unread_info = await session_manager.get_unread_info(user.id, w.window_name)
+            if unread_info:
+                if unread_info.has_unread:
+                    # User has unread messages, send catch-up via send_history
+                    await send_history(
+                        None,  # target not used in direct send mode
+                        w.window_name,
+                        start_byte=unread_info.start_offset,
+                        end_byte=unread_info.end_offset,
+                        user_id=user.id,
+                        bot=context.bot,
+                    )
+                else:
+                    # First time or no unread - initialize offset to current file size
+                    session_manager.update_user_window_offset(
+                        user.id, w.window_name, unread_info.end_offset
+                    )
+
+            # Step 4: Now set active window (enables new message delivery)
+            session_manager.set_active_window(user.id, w.window_name)
+
             await query.answer(f"Active: {w.window_name}")
         else:
             await query.answer("Window no longer exists", show_alert=True)
 
     # List: new session
     elif data == CB_LIST_NEW:
-        start_path = str(config.browse_root_dir)
+        # Start from current active window's cwd, fallback to browse_root_dir
+        start_path = str(Path.cwd())
+        active_wname = session_manager.get_active_window_name(user.id)
+        if active_wname:
+            w = await tmux_manager.find_window_by_name(active_wname)
+            if w and w.cwd:
+                start_path = w.cwd
+
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
             context.user_data[BROWSE_PATH_KEY] = start_path
             context.user_data[BROWSE_PAGE_KEY] = 0
-        msg_text, keyboard = build_directory_browser(start_path)
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
         await _safe_edit(query, msg_text, reply_markup=keyboard)
         await query.answer()
 
@@ -1180,6 +1359,7 @@ async def _enqueue_content_message(
 def _build_response_parts(
     window_name: str, text: str, is_complete: bool,
     content_type: str = "text",
+    role: str = "assistant",
 ) -> list[str]:
     """Build paginated response messages for Telegram.
 
@@ -1187,6 +1367,15 @@ def _build_response_parts(
     Multi-part messages get a [1/N] suffix.
     """
     text = text.strip()
+
+    # User messages: add emoji prefix (no newline)
+    if role == "user":
+        prefix = "👤 "
+        separator = ""
+        # User messages are typically short, no special processing needed
+        if len(text) > 3000:
+            text = text[:3000] + "…"
+        return [convert_markdown(f"{prefix}{text}")]
 
     # Truncate thinking content to keep it compact
     if content_type == "thinking" and is_complete:
@@ -1278,7 +1467,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
     for user_id, wname in active_users:
         parts = _build_response_parts(
-            wname, msg.text, msg.is_complete, msg.content_type,
+            wname, msg.text, msg.is_complete, msg.content_type, msg.role,
         )
 
         if msg.is_complete:
@@ -1295,6 +1484,16 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 is_complete=True,
                 text=msg.text,
             )
+
+            # Update user's read offset to current file position
+            # This marks these messages as "read" for this user
+            session = await session_manager.resolve_session_for_window(wname)
+            if session and session.file_path:
+                try:
+                    file_size = Path(session.file_path).stat().st_size
+                    session_manager.update_user_window_offset(user_id, wname, file_size)
+                except OSError:
+                    pass
 
 
 # --- App lifecycle ---
@@ -1414,10 +1613,19 @@ async def forward_command_handler(update: Update, context: ContextTypes.DEFAULT_
         await _safe_reply(update.message, f"❌ {message}")
 
 
-async def _build_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Build inline keyboard with session buttons for /list."""
+async def _build_list_keyboard(
+    user_id: int,
+    pending_selection: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard with session buttons for /list.
+
+    Args:
+        user_id: User ID to check active window for.
+        pending_selection: Override active window name for display (used during
+            window switch to show checkmark before active_sessions is updated).
+    """
     active_items = await session_manager.list_active_sessions()
-    active_wname = session_manager.get_active_window_name(user_id)
+    active_wname = pending_selection or session_manager.get_active_window_name(user_id)
 
     buttons: list[list[InlineKeyboardButton]] = []
     for w, session in active_items:

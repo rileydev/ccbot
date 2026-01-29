@@ -121,7 +121,6 @@ cp .env.example .env
 |---|---|---|
 | `TMUX_SESSION_NAME` | `ccmux` | Tmux session name |
 | `CLAUDE_COMMAND` | `claude --dangerously-skip-permissions` | Command to run in new windows |
-| `BROWSE_ROOT_DIR` | cwd | Root directory for file browser |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Polling interval in seconds |
 | `MONITOR_STABLE_WAIT` | `2.0` | File stability wait time in seconds |
 
