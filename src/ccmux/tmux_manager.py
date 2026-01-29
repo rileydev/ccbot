@@ -175,13 +175,17 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_capture)
 
-    async def send_keys(self, window_id: str, text: str, enter: bool = True) -> bool:
+    async def send_keys(
+        self, window_id: str, text: str, enter: bool = True, literal: bool = True
+    ) -> bool:
         """Send keys to a specific window.
 
         Args:
             window_id: The window ID to send to
             text: Text to send
             enter: Whether to press enter after the text
+            literal: If True, send text literally. If False, interpret special keys
+                     like "Up", "Down", "Left", "Right", "Escape", "Enter".
 
         Returns:
             True if successful, False otherwise
@@ -203,7 +207,7 @@ class TmuxManager:
                     logger.error(f"No active pane in window {window_id}")
                     return False
 
-                pane.send_keys(text, enter=enter)
+                pane.send_keys(text, enter=enter, literal=literal)
                 return True
 
             except Exception as e:

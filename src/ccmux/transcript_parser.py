@@ -33,6 +33,7 @@ class ParsedEntry:
     content_type: str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
     tool_use_id: str | None = None
     timestamp: str | None = None  # ISO timestamp from JSONL
+    tool_name: str | None = None  # For tool_use entries, the tool name (e.g. "AskUserQuestion")
 
 
 @dataclass
@@ -553,11 +554,19 @@ class TranscriptParser:
                                 tool_name=name,
                                 input_data=input_data,
                             )
+                            # Also emit tool_use entry with tool_name for immediate handling
+                            result.append(ParsedEntry(
+                                role="assistant", text=summary, content_type="tool_use",
+                                tool_use_id=tool_id,
+                                timestamp=entry_timestamp,
+                                tool_name=name,
+                            ))
                         else:
                             result.append(ParsedEntry(
                                 role="assistant", text=summary, content_type="tool_use",
                                 tool_use_id=tool_id or None,
                                 timestamp=entry_timestamp,
+                                tool_name=name,
                             ))
 
                     elif btype == "thinking":

@@ -110,6 +110,12 @@ Bot 使用 per-user 消息队列 + worker 模式处理所有发送任务，确�
 - Status 消息始终在 content 消息之后
 - 多用户并发处理互不干扰
 
+**消息合并**：Worker 出队时自动合并连续可合并的 content 消息，减少 API 调用：
+- 同一 window 的 content 消息可以合并（包括 text、thinking）
+- tool_use 中断合并链，单独发送（记录消息 ID 供后续编辑）
+- tool_result 中断合并链，单独编辑到 tool_use 消息（避免顺序错乱）
+- 合并后总长度超过 3800 字符时停止合并（避免分页）
+
 队列溢出保护（`MAX_QUEUE_SIZE = 5`）：当队列消息数超过阈值时，自动 compact：
 - 保留第一条消息（提供上下文）
 - 保留最后 N 条消息（最新内容）
@@ -118,8 +124,6 @@ Bot 使用 per-user 消息队列 + worker 模式处理所有发送任务，确�
 ### Status 消息处理
 
 Status 消息（Claude 状态行）采用特殊处理优化用户体验：
-
-**去重**：入队前移除同一 window 的旧 status 消息，确保队列中每个 window 只有一条 status。
 
 **转换**：将 status 消息编辑为第一条 content 消息，减少消息数量：
 - 有 status 消息时，第一条 content 通过 edit 更新 status 消息

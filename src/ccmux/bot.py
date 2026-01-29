@@ -33,6 +33,7 @@ from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .telegram_sender import split_message
+from .terminal_parser import extract_ask_question_content, is_ask_question_ui
 from .tmux_manager import tmux_manager
 
 logger = logging.getLogger(__name__)
@@ -240,9 +241,81 @@ async def _check_and_compact_queue(
             queue.put_nowait(item)
 
 
+def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
+    """Check if two content tasks can be merged."""
+    if base.window_name != candidate.window_name:
+        return False
+    if candidate.task_type != "content":
+        return False
+    # tool_use/tool_result break merge chain
+    # - tool_use: will be edited later by tool_result
+    # - tool_result: edits previous message, merging would cause order issues
+    if base.content_type in ("tool_use", "tool_result"):
+        return False
+    if candidate.content_type in ("tool_use", "tool_result"):
+        return False
+    return True
+
+
+MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
+
+
+async def _merge_content_tasks(
+    queue: asyncio.Queue[MessageTask],
+    first: MessageTask,
+    lock: asyncio.Lock,
+) -> tuple[MessageTask, int]:
+    """Merge consecutive content tasks from queue.
+
+    Returns: (merged_task, merge_count) where merge_count is the number of
+    additional tasks merged (0 if no merging occurred).
+    """
+    merged_parts = list(first.parts)
+    current_length = sum(len(p) for p in merged_parts)
+    merge_count = 0
+
+    async with lock:
+        items = _inspect_queue(queue)
+        remaining: list[MessageTask] = []
+
+        for i, task in enumerate(items):
+            if not _can_merge_tasks(first, task):
+                # Can't merge, keep this and all remaining items
+                remaining = items[i:]
+                break
+
+            # Check length before merging
+            task_length = sum(len(p) for p in task.parts)
+            if current_length + task_length > MERGE_MAX_LENGTH:
+                # Too long, stop merging
+                remaining = items[i:]
+                break
+
+            merged_parts.extend(task.parts)
+            current_length += task_length
+            merge_count += 1
+
+        # Put remaining items back into the queue
+        for item in remaining:
+            queue.put_nowait(item)
+
+    if merge_count == 0:
+        return first, 0
+
+    return MessageTask(
+        task_type="content",
+        window_name=first.window_name,
+        parts=merged_parts,
+        tool_use_id=first.tool_use_id,
+        content_type=first.content_type,
+        is_complete=True,
+    ), merge_count
+
+
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
     """Process message tasks for a user sequentially."""
     queue = _message_queues[user_id]
+    lock = _queue_locks[user_id]
     logger.info(f"Message queue worker started for user {user_id}")
 
     while True:
@@ -250,7 +323,18 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             task = await queue.get()
             try:
                 if task.task_type == "content":
-                    await _process_content_task(bot, user_id, task)
+                    # Try to merge consecutive content tasks
+                    merged_task, merge_count = await _merge_content_tasks(
+                        queue, task, lock
+                    )
+                    if merge_count > 0:
+                        logger.debug(
+                            f"Merged {merge_count} tasks for user {user_id}"
+                        )
+                        # Mark merged tasks as done
+                        for _ in range(merge_count):
+                            queue.task_done()
+                    await _process_content_task(bot, user_id, merged_task)
                 elif task.task_type == "status_update":
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
@@ -270,31 +354,32 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     """Process a content message task."""
     wname = task.window_name or ""
 
-    # 1. Handle tool_result editing (lookup happens here to ensure sequential order)
-    if task.content_type == "tool_result" and task.tool_use_id and task.text:
+    # 1. Handle tool_result editing (merged parts are edited together)
+    if task.content_type == "tool_result" and task.tool_use_id:
         _tkey = (task.tool_use_id, user_id)
         edit_msg_id = _tool_msg_ids.pop(_tkey, None)
         if edit_msg_id is not None:
-            # Clear status message first (tool_result edits a different message)
-            # Don't remove keyboard - _check_and_send_status will send new status with keyboard
+            # Clear status message first
             await _do_clear_status_message(bot, user_id)
-            text_md = convert_markdown(task.text)
+            # Join all parts for editing (merged content goes together)
+            full_text = "\n\n".join(task.parts)
             try:
                 await bot.edit_message_text(
                     chat_id=user_id,
                     message_id=edit_msg_id,
-                    text=text_md,
+                    text=full_text,
                     parse_mode="MarkdownV2",
                 )
-                # After content, check and send status
                 await _check_and_send_status(bot, user_id, wname)
                 return
             except Exception:
                 try:
+                    # Fallback: strip markdown
+                    plain_text = task.text or full_text
                     await bot.edit_message_text(
                         chat_id=user_id,
                         message_id=edit_msg_id,
-                        text=task.text,
+                        text=plain_text,
                     )
                     await _check_and_send_status(bot, user_id, wname)
                     return
@@ -313,7 +398,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             first_part = False
             converted_msg_id = await _convert_status_to_content(bot, user_id, wname, part)
             if converted_msg_id is not None:
-                # Status message was edited to show content
                 last_msg_id = converted_msg_id
                 continue
 
@@ -331,11 +415,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         if sent:
             last_msg_id = sent.message_id
 
-    # Record tool_use message ID for later editing (use last message sent)
+    # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id)] = last_msg_id
 
-    # 3. After content, check and send status
+    # 4. After content, check and send status
     await _check_and_send_status(bot, user_id, wname)
 
 
@@ -509,6 +593,21 @@ CB_SESSION_KILL = "sa:kill:"
 
 # Screenshot callback prefix
 CB_SCREENSHOT_REFRESH = "ss:ref:"
+
+# AskUserQuestion callback prefixes
+CB_ASK_UP = "aq:up:"       # aq:up:<window>
+CB_ASK_DOWN = "aq:down:"   # aq:down:<window>
+CB_ASK_LEFT = "aq:left:"   # aq:left:<window>
+CB_ASK_RIGHT = "aq:right:" # aq:right:<window>
+CB_ASK_ESC = "aq:esc:"     # aq:esc:<window>
+CB_ASK_ENTER = "aq:enter:" # aq:enter:<window>
+CB_ASK_REFRESH = "aq:ref:" # aq:ref:<window>
+
+# Track AskUserQuestion message IDs: user_id -> message_id
+_ask_question_msgs: dict[int, int] = {}
+
+# Track interactive mode: user_id -> window_name (None if not in interactive mode)
+_interactive_mode: dict[int, str] = {}
 
 # Bot's own commands — handled locally, NOT forwarded to Claude Code
 BOT_COMMANDS = {"start", "list", "history", "screenshot", "esc"}
@@ -911,6 +1010,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         success, message = await session_manager.send_to_active_session(user.id, text)
         if not success:
             await _safe_reply(update.message, f"❌ {message}")
+            return
+
+        # If in interactive mode, refresh the UI after sending text
+        interactive_window = _get_interactive_window(user.id)
+        if interactive_window and interactive_window == active_wname:
+            await asyncio.sleep(0.2)  # Wait for terminal to update
+            await _handle_ask_question_ui(context.bot, user.id, active_wname)
         return
 
     await _safe_reply(
@@ -1202,6 +1308,71 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "noop":
         await query.answer()
 
+    # AskUserQuestion: Up arrow
+    elif data.startswith(CB_ASK_UP):
+        window_name = data[len(CB_ASK_UP):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Up", enter=False, literal=False)
+            await asyncio.sleep(0.15)
+            await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer()
+
+    # AskUserQuestion: Down arrow
+    elif data.startswith(CB_ASK_DOWN):
+        window_name = data[len(CB_ASK_DOWN):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Down", enter=False, literal=False)
+            await asyncio.sleep(0.15)
+            await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer()
+
+    # AskUserQuestion: Left arrow
+    elif data.startswith(CB_ASK_LEFT):
+        window_name = data[len(CB_ASK_LEFT):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Left", enter=False, literal=False)
+            await asyncio.sleep(0.15)
+            await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer()
+
+    # AskUserQuestion: Right arrow
+    elif data.startswith(CB_ASK_RIGHT):
+        window_name = data[len(CB_ASK_RIGHT):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Right", enter=False, literal=False)
+            await asyncio.sleep(0.15)
+            await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer()
+
+    # AskUserQuestion: Escape
+    elif data.startswith(CB_ASK_ESC):
+        window_name = data[len(CB_ASK_ESC):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Escape", enter=False, literal=False)
+            await _clear_ask_question_msg(user.id)
+        await query.answer("⎋ Esc")
+
+    # AskUserQuestion: Enter
+    elif data.startswith(CB_ASK_ENTER):
+        window_name = data[len(CB_ASK_ENTER):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w:
+            await tmux_manager.send_keys(w.window_id, "Enter", enter=False, literal=False)
+            await asyncio.sleep(0.15)
+            await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer("⏎ Enter")
+
+    # AskUserQuestion: refresh display
+    elif data.startswith(CB_ASK_REFRESH):
+        window_name = data[len(CB_ASK_REFRESH):]
+        await _handle_ask_question_ui(context.bot, user.id, window_name)
+        await query.answer("🔄")
+
 
 # --- Status line polling ---
 
@@ -1232,77 +1403,22 @@ def _parse_status_line(pane_text: str) -> str | None:
 
 
 async def _enqueue_status_update(bot: Bot, user_id: int, window_name: str, status_text: str | None) -> None:
-    """Enqueue status update, removing old status for same window.
-
-    Status messages are ephemeral - only the latest matters.
-    Remove all pending status_update tasks for the same window.
-
-    Optimized: drain/refill only once, combining deduplication and compaction.
-    """
+    """Enqueue status update."""
     queue = _get_or_create_queue(bot, user_id)
-    lock = _queue_locks.get(user_id)
-    if not lock:
-        logger.error(f"No lock found for user {user_id}, skipping enqueue")
-        return
 
-    async with lock:
-        # Drain queue once
-        items = _inspect_queue(queue)
+    # Check queue size and compact if needed
+    await _check_and_compact_queue(bot, user_id, queue)
 
-        # 1. Remove old status messages for the same window (deduplication)
-        filtered_items: list[MessageTask] = []
-        removed_count = 0
+    if status_text:
+        task = MessageTask(
+            task_type="status_update",
+            text=status_text,
+            window_name=window_name,
+        )
+    else:
+        task = MessageTask(task_type="status_clear")
 
-        for task in items:
-            # Remove old status_update for SAME window
-            if task.task_type == "status_update" and task.window_name == window_name:
-                removed_count += 1
-                continue
-            filtered_items.append(task)
-
-        if removed_count > 0:
-            logger.debug(f"Deduped {removed_count} stale status for user {user_id}")
-
-        # 2. Check if compaction is needed after deduplication
-        if len(filtered_items) > MAX_QUEUE_SIZE and QUEUE_CHECK_ENABLED:
-            logger.warning(
-                f"Queue overflow for user {user_id}: "
-                f"{len(filtered_items)} messages after dedup (max {MAX_QUEUE_SIZE})"
-            )
-            compacted, num_dropped = _compact_queue(filtered_items, MAX_QUEUE_SIZE)
-
-            if num_dropped > 0:
-                # Insert warning message
-                warning_text = (
-                    f"⚠️ 消息量过多，已丢弃 {num_dropped} 条中间消息\n\n"
-                    f"（保留了最新的 {len(compacted)} 条消息）"
-                )
-                warning_task = MessageTask(
-                    task_type="content",
-                    text=warning_text,
-                    window_name=None,
-                    parts=[convert_markdown(warning_text)],
-                    is_complete=True,
-                )
-                queue.put_nowait(warning_task)
-
-            filtered_items = compacted
-
-        # 3. Refill queue with filtered/compacted items
-        for item in filtered_items:
-            queue.put_nowait(item)
-
-        # 4. Enqueue new status message
-        if status_text:
-            task = MessageTask(
-                task_type="status_update",
-                text=status_text,
-                window_name=window_name,
-            )
-        else:
-            task = MessageTask(task_type="status_clear")
-
-        queue.put_nowait(task)
+    queue.put_nowait(task)
 
 
 async def _update_status_message(bot: Bot, user_id: int, window_name: str) -> None:
@@ -1351,6 +1467,107 @@ async def _enqueue_content_message(
         is_complete=is_complete,
     )
     queue.put_nowait(task)
+
+
+# --- AskUserQuestion handling ---
+
+
+def _build_ask_question_keyboard(window_name: str) -> InlineKeyboardMarkup:
+    """Build keyboard for AskUserQuestion UI navigation."""
+    return InlineKeyboardMarkup([
+        # Row 1: directional keys
+        [
+            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_name}"[:64]),
+        ],
+        [
+            InlineKeyboardButton("←", callback_data=f"{CB_ASK_LEFT}{window_name}"[:64]),
+            InlineKeyboardButton("↓", callback_data=f"{CB_ASK_DOWN}{window_name}"[:64]),
+            InlineKeyboardButton("→", callback_data=f"{CB_ASK_RIGHT}{window_name}"[:64]),
+        ],
+        # Row 2: action keys
+        [
+            InlineKeyboardButton("⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_name}"[:64]),
+            InlineKeyboardButton("🔄", callback_data=f"{CB_ASK_REFRESH}{window_name}"[:64]),
+            InlineKeyboardButton("⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_name}"[:64]),
+        ],
+    ])
+
+
+async def _handle_ask_question_ui(
+    bot: Bot,
+    user_id: int,
+    window_name: str,
+) -> bool:
+    """Capture terminal and send AskUserQuestion UI content to user.
+
+    Returns True if UI was detected and sent, False otherwise.
+    """
+    w = await tmux_manager.find_window_by_name(window_name)
+    if not w:
+        return False
+
+    # Capture plain text (no ANSI colors)
+    pane_text = await tmux_manager.capture_pane(w.window_id)
+    if not pane_text:
+        return False
+
+    # Quick check if it looks like AskUserQuestion UI
+    if not is_ask_question_ui(pane_text):
+        return False
+
+    # Extract content between separators
+    content = extract_ask_question_content(pane_text)
+    if not content:
+        return False
+
+    # Build message with navigation keyboard
+    keyboard = _build_ask_question_keyboard(window_name)
+
+    # Send as plain text (no markdown conversion)
+    text = content.content
+
+    # Check if we have an existing AskQuestion message to edit
+    existing_msg_id = _ask_question_msgs.get(user_id)
+    if existing_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=existing_msg_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            _interactive_mode[user_id] = window_name
+            return True
+        except Exception:
+            # Message unchanged or other error - silently ignore, don't send new
+            return True
+
+    # Send new message
+    await _rate_limit_send(user_id)
+    try:
+        sent = await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+        _ask_question_msgs[user_id] = sent.message_id
+        _interactive_mode[user_id] = window_name
+    except Exception as e:
+        logger.error(f"Failed to send AskQuestion UI to {user_id}: {e}")
+        return False
+
+    return True
+
+
+async def _clear_ask_question_msg(user_id: int) -> None:
+    """Clear tracked AskQuestion message and exit interactive mode."""
+    _ask_question_msgs.pop(user_id, None)
+    _interactive_mode.pop(user_id, None)
+
+
+def _get_interactive_window(user_id: int) -> str | None:
+    """Get the window name for user's interactive mode."""
+    return _interactive_mode.get(user_id)
 
 
 # --- Streaming response / notifications ---
@@ -1466,11 +1683,32 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         return
 
     for user_id, wname in active_users:
+        # Handle AskUserQuestion tool specially - capture terminal and send UI
+        if msg.tool_name == "AskUserQuestion" and msg.content_type == "tool_use":
+            # Wait briefly for Claude Code to render the question UI
+            await asyncio.sleep(0.3)
+            handled = await _handle_ask_question_ui(bot, user_id, wname)
+            if handled:
+                # Update user's read offset
+                session = await session_manager.resolve_session_for_window(wname)
+                if session and session.file_path:
+                    try:
+                        file_size = Path(session.file_path).stat().st_size
+                        session_manager.update_user_window_offset(user_id, wname, file_size)
+                    except OSError:
+                        pass
+                continue  # Don't send the normal tool_use message
+
         parts = _build_response_parts(
             wname, msg.text, msg.is_complete, msg.content_type, msg.role,
         )
 
         if msg.is_complete:
+            # Clear AskQuestion message tracking when we get a non-AskUserQuestion message
+            # (the question UI was answered or cancelled)
+            if msg.tool_name != "AskUserQuestion":
+                await _clear_ask_question_msg(user_id)
+
             # Enqueue content message task
             # Note: tool_result editing is handled inside _process_content_task
             # to ensure sequential processing with tool_use message sending

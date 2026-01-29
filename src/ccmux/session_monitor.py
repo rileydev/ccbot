@@ -48,6 +48,7 @@ class NewMessage:
     content_type: str = "text"  # "text" or "thinking"
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
+    tool_name: str | None = None  # For tool_use messages, the tool name
 
 
 class SessionMonitor:
@@ -318,6 +319,7 @@ class SessionMonitor:
                         content_type=entry.content_type,
                         tool_use_id=entry.tool_use_id,
                         role=entry.role,
+                        tool_name=entry.tool_name,
                     ))
 
                 tracked.project_path = session_info.project_path
