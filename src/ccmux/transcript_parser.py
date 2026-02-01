@@ -1,7 +1,14 @@
 """JSONL transcript parser for Claude Code session files.
 
-Parses Claude Code session JSONL files and extracts message content.
+Parses Claude Code session JSONL files and extracts structured messages.
+Handles: text, thinking, tool_use, tool_result, local_command, and user messages.
+Tool pairing: tool_use blocks in assistant messages are matched with
+tool_result blocks in subsequent user messages via tool_use_id.
+
+Shared by both session.py (history) and session_monitor.py (real-time).
 Format reference: https://github.com/desis123/claude-code-viewer
+
+Key classes: TranscriptParser (static methods), ParsedEntry, PendingToolInfo.
 """
 
 from __future__ import annotations
@@ -18,10 +25,8 @@ class ParsedMessage:
     """Parsed message from a transcript."""
 
     message_type: str  # "user", "assistant", "tool_use", "tool_result", etc.
-    role: str | None  # "user" or "assistant"
     text: str  # Extracted text content
     tool_name: str | None = None  # For tool_use messages
-    raw: dict | None = None  # Original data
 
 
 @dataclass
@@ -89,11 +94,6 @@ class TranscriptParser:
             Message type: "user", "assistant", "file-history-snapshot", etc.
         """
         return data.get("type")
-
-    @staticmethod
-    def is_assistant_message(data: dict) -> bool:
-        """Check if this is an assistant message."""
-        return data.get("type") == "assistant"
 
     @staticmethod
     def is_user_message(data: dict) -> bool:
@@ -247,7 +247,6 @@ class TranscriptParser:
         message = data.get("message")
         if not isinstance(message, dict):
             return None
-        role = message.get("role")
         content = message.get("content", "")
 
         if isinstance(content, list):
@@ -265,112 +264,27 @@ class TranscriptParser:
                 cmd = cmd_match.group(1) if cmd_match else None
                 return ParsedMessage(
                     message_type="local_command",
-                    role="assistant",
                     text=stdout,
                     tool_name=cmd,  # reuse field for command name
-                    raw=data,
                 )
             # Pure command invocation (no stdout) — carry command name
             cmd_match = cls._RE_COMMAND_NAME.search(text)
             if cmd_match:
                 return ParsedMessage(
                     message_type="local_command_invoke",
-                    role=None,
                     text="",
                     tool_name=cmd_match.group(1),
-                    raw=data,
                 )
 
         return ParsedMessage(
             message_type=msg_type,
-            role=role,
             text=text,
-            raw=data,
         )
-
-    @classmethod
-    def extract_assistant_text(cls, data: dict) -> str | None:
-        """Extract text content from an assistant message.
-
-        This is a convenience method for getting just the text
-        from an assistant message, suitable for notifications.
-        Filters out "(no content)" placeholder text.
-
-        Args:
-            data: Parsed JSON dict from a JSONL line
-
-        Returns:
-            Text content or None if not an assistant message
-        """
-        if not cls.is_assistant_message(data):
-            return None
-
-        message = data.get("message", {})
-        content = message.get("content", [])
-
-        text = cls.extract_text_only(content)
-        # Filter out "(no content)" placeholder
-        if text and text.strip() == cls._NO_CONTENT_PLACEHOLDER:
-            return None
-        return text
-
-    @classmethod
-    def extract_assistant_content(cls, data: dict) -> tuple[str, str] | None:
-        """Extract content and its type from an assistant message.
-
-        Returns:
-            (text, content_type) where content_type is "text" or "thinking",
-            or None if not an assistant message or no content.
-        """
-        if not cls.is_assistant_message(data):
-            return None
-
-        message = data.get("message", {})
-        content = message.get("content", [])
-        if not isinstance(content, list):
-            return None
-
-        # Collect all text and thinking blocks
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "thinking":
-                thinking = item.get("thinking", "")
-                if thinking:
-                    thinking_parts.append(thinking)
-            elif item.get("type") == "text":
-                text = item.get("text", "")
-                if text and text.strip() != cls._NO_CONTENT_PLACEHOLDER:
-                    text_parts.append(text)
-
-        if text_parts:
-            return ("\n".join(text_parts), "text")
-        if thinking_parts:
-            return ("\n".join(thinking_parts), "thinking")
-        return None
-
-    @staticmethod
-    def get_session_id(data: dict) -> str | None:
-        """Extract session ID from message data."""
-        return data.get("sessionId")
-
-    @staticmethod
-    def get_cwd(data: dict) -> str | None:
-        """Extract working directory (cwd) from message data."""
-        return data.get("cwd")
 
     @staticmethod
     def get_timestamp(data: dict) -> str | None:
         """Extract timestamp from message data."""
         return data.get("timestamp")
-
-    @staticmethod
-    def get_uuid(data: dict) -> str | None:
-        """Extract message UUID from message data."""
-        return data.get("uuid")
 
     EXPANDABLE_QUOTE_START = "\x02EXPQUOTE_START\x02"
     EXPANDABLE_QUOTE_END = "\x02EXPQUOTE_END\x02"

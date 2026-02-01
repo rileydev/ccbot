@@ -1,11 +1,15 @@
-"""Terminal output parser for Claude Code.
+"""Terminal output parser — detects Claude Code UI elements in pane text.
 
-Parses terminal (pane) text to detect:
-- Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt)
-- Status line (spinner + text shown while Claude is working)
+Parses captured tmux pane content to detect:
+  - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
+    RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
+    delimiters.
+  - Status line (spinner characters + working text) by scanning from bottom up.
 
-All Claude Code text patterns live here.  To support a new UI type or
+All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
+
+Key functions: is_interactive_ui(), extract_interactive_content(), parse_status_line().
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ class InteractiveUIContent:
     """Content extracted from an interactive UI."""
 
     content: str  # The extracted display content
-    supports_esc: bool = True  # Interactive UIs support Esc
+    name: str = ""  # Pattern name that matched (e.g. "AskUserQuestion")
 
 
 @dataclass(frozen=True)
@@ -31,7 +35,7 @@ class UIPattern:
     Both boundary lines are included in the extracted content.
     """
 
-    name: str
+    name: str  # Descriptive label (not used programmatically)
     top: re.Pattern[str]
     bottom: re.Pattern[str]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
@@ -55,6 +59,11 @@ UI_PATTERNS: list[UIPattern] = [
         name="PermissionPrompt",
         top=re.compile(r"^\s*Do you want to proceed\?"),
         bottom=re.compile(r"^\s*Esc to cancel"),
+    ),
+    UIPattern(
+        name="RestoreCheckpoint",
+        top=re.compile(r"^\s*Restore the code"),
+        bottom=re.compile(r"^\s*Enter to continue"),
     ),
 ]
 
@@ -92,7 +101,7 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
         return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1])
-    return InteractiveUIContent(content=_shorten_separators(content))
+    return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
 
 
 # ── Public API ───────────────────────────────────────────────────────────

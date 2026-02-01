@@ -1,4 +1,19 @@
-"""Telegram bot handlers for Claude Code session monitoring."""
+"""Telegram bot handlers — the main UI layer of CCMux.
+
+Registers all command/callback/message handlers and manages the bot lifecycle.
+Core responsibilities:
+  - Command handlers: /start, /list, /history, /screenshot, /esc, plus
+    forwarding unknown /commands to Claude Code via tmux.
+  - Callback query handler: session selection, directory browser, history
+    pagination, interactive UI navigation, screenshot refresh.
+  - Per-user message queue + worker: ensures ordered delivery, merges
+    consecutive content messages, and converts status→content in-place.
+  - Status polling loop: polls terminal status lines for all active users.
+  - Interactive UI: detects AskUserQuestion/ExitPlanMode/PermissionPrompt
+    in terminal output and renders inline-keyboard navigation.
+
+Key functions: create_bot(), handle_new_message(), send_history().
+"""
 
 import asyncio
 import io
@@ -14,6 +29,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    LinkPreviewOptions,
     ReplyKeyboardRemove,
     Update,
 )
@@ -37,6 +53,9 @@ from .terminal_parser import extract_interactive_content, is_interactive_ui, par
 from .tmux_manager import tmux_manager
 
 logger = logging.getLogger(__name__)
+
+# Disable link previews in all messages to reduce visual noise
+_NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # Session monitor instance
 session_monitor: SessionMonitor | None = None
@@ -82,7 +101,6 @@ class MessageTask:
     parts: list[str] = field(default_factory=list)
     tool_use_id: str | None = None
     content_type: str = "text"
-    is_complete: bool = True
 
 
 # Per-user message queues and worker tasks
@@ -188,7 +206,6 @@ async def _merge_content_tasks(
         parts=merged_parts,
         tool_use_id=first.tool_use_id,
         content_type=first.content_type,
-        is_complete=True,
     ), merge_count
 
 
@@ -249,6 +266,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     message_id=edit_msg_id,
                     text=full_text,
                     parse_mode="MarkdownV2",
+                    link_preview_options=_NO_LINK_PREVIEW,
                 )
                 await _check_and_send_status(bot, user_id, wname)
                 return
@@ -260,6 +278,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         chat_id=user_id,
                         message_id=edit_msg_id,
                         text=plain_text,
+                        link_preview_options=_NO_LINK_PREVIEW,
                     )
                     await _check_and_send_status(bot, user_id, wname)
                     return
@@ -284,11 +303,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         await _rate_limit_send(user_id)
         try:
             sent = await bot.send_message(
-                chat_id=user_id, text=part, parse_mode="MarkdownV2"
+                chat_id=user_id, text=part, parse_mode="MarkdownV2",
+                link_preview_options=_NO_LINK_PREVIEW,
             )
         except Exception:
             try:
-                sent = await bot.send_message(chat_id=user_id, text=part)
+                sent = await bot.send_message(
+                    chat_id=user_id, text=part,
+                    link_preview_options=_NO_LINK_PREVIEW,
+                )
             except Exception as e:
                 logger.error(f"Failed to send message to {user_id}: {e}")
 
@@ -332,6 +355,7 @@ async def _convert_status_to_content(
             message_id=msg_id,
             text=content_text,
             parse_mode="MarkdownV2",
+            link_preview_options=_NO_LINK_PREVIEW,
         )
         return msg_id
     except Exception:
@@ -341,6 +365,7 @@ async def _convert_status_to_content(
                 chat_id=user_id,
                 message_id=msg_id,
                 text=content_text,
+                link_preview_options=_NO_LINK_PREVIEW,
             )
             return msg_id
         except Exception as e:
@@ -391,6 +416,7 @@ async def _process_status_update_task(bot: Bot, user_id: int, task: MessageTask)
                     message_id=msg_id,
                     text=convert_markdown(status_text),
                     parse_mode="MarkdownV2",
+                    link_preview_options=_NO_LINK_PREVIEW,
                 )
                 _status_msg_info[user_id] = (msg_id, wname, status_text)
             except Exception:
@@ -399,6 +425,7 @@ async def _process_status_update_task(bot: Bot, user_id: int, task: MessageTask)
                         chat_id=user_id,
                         message_id=msg_id,
                         text=status_text,
+                        link_preview_options=_NO_LINK_PREVIEW,
                     )
                     _status_msg_info[user_id] = (msg_id, wname, status_text)
                 except Exception as e:
@@ -420,11 +447,15 @@ async def _do_send_status_message(
             chat_id=user_id,
             text=convert_markdown(text),
             parse_mode="MarkdownV2",
+            link_preview_options=_NO_LINK_PREVIEW,
         )
         _status_msg_info[user_id] = (sent.message_id, window_name, text)
     except Exception:
         try:
-            sent = await bot.send_message(chat_id=user_id, text=text)
+            sent = await bot.send_message(
+                chat_id=user_id, text=text,
+                link_preview_options=_NO_LINK_PREVIEW,
+            )
             _status_msg_info[user_id] = (sent.message_id, window_name, text)
         except Exception as e:
             logger.error(f"Failed to send status message to {user_id}: {e}")
@@ -496,9 +527,6 @@ INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # Track interactive mode: user_id -> window_name (None if not in interactive mode)
 _interactive_mode: dict[int, str] = {}
 
-# Bot's own commands — handled locally, NOT forwarded to Claude Code
-BOT_COMMANDS = {"start", "list", "history", "screenshot", "esc"}
-
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
     "clear": "↗ Clear conversation history",
@@ -562,6 +590,7 @@ async def _build_session_detail(
 
 async def _safe_reply(message, text: str, **kwargs):  # type: ignore[no-untyped-def]
     """Reply with MarkdownV2, falling back to plain text on failure."""
+    kwargs.setdefault("link_preview_options", _NO_LINK_PREVIEW)
     try:
         return await message.reply_text(
             convert_markdown(text), parse_mode="MarkdownV2", **kwargs,
@@ -572,6 +601,7 @@ async def _safe_reply(message, text: str, **kwargs):  # type: ignore[no-untyped-
 
 async def _safe_edit(target, text: str, **kwargs) -> None:  # type: ignore[no-untyped-def]
     """Edit message with MarkdownV2, falling back to plain text on failure."""
+    kwargs.setdefault("link_preview_options", _NO_LINK_PREVIEW)
     try:
         await target.edit_message_text(
             convert_markdown(text), parse_mode="MarkdownV2", **kwargs,
@@ -585,6 +615,7 @@ async def _safe_edit(target, text: str, **kwargs) -> None:  # type: ignore[no-un
 
 async def _safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
     """Send message with MarkdownV2, falling back to plain text on failure."""
+    kwargs.setdefault("link_preview_options", _NO_LINK_PREVIEW)
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -665,7 +696,6 @@ async def send_history(
 
     messages, total = await session_manager.get_recent_messages(
         window_name,
-        count=0,
         start_byte=start_byte,
         end_byte=end_byte if end_byte > 0 else None,
     )
@@ -1338,7 +1368,6 @@ async def _enqueue_content_message(
     parts: list[str],
     tool_use_id: str | None = None,
     content_type: str = "text",
-    is_complete: bool = True,
     text: str | None = None,
 ) -> None:
     """Enqueue a content message task."""
@@ -1351,7 +1380,6 @@ async def _enqueue_content_message(
         parts=parts,
         tool_use_id=tool_use_id,
         content_type=content_type,
-        is_complete=is_complete,
     )
     queue.put_nowait(task)
 
@@ -1359,25 +1387,38 @@ async def _enqueue_content_message(
 # --- Interactive UI handling (AskUserQuestion / ExitPlanMode / Permission Prompt) ---
 
 
-def _build_interactive_keyboard(window_name: str) -> InlineKeyboardMarkup:
-    """Build keyboard for interactive UI navigation."""
-    return InlineKeyboardMarkup([
-        # Row 1: directional keys
-        [
-            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_name}"[:64]),
-        ],
-        [
+def _build_interactive_keyboard(
+    window_name: str, ui_name: str = "",
+) -> InlineKeyboardMarkup:
+    """Build keyboard for interactive UI navigation.
+
+    ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
+    since only vertical selection is needed.
+    """
+    vertical_only = ui_name == "RestoreCheckpoint"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Row 1: directional keys
+    rows.append([
+        InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_name}"[:64]),
+    ])
+    if vertical_only:
+        rows.append([
+            InlineKeyboardButton("↓", callback_data=f"{CB_ASK_DOWN}{window_name}"[:64]),
+        ])
+    else:
+        rows.append([
             InlineKeyboardButton("←", callback_data=f"{CB_ASK_LEFT}{window_name}"[:64]),
             InlineKeyboardButton("↓", callback_data=f"{CB_ASK_DOWN}{window_name}"[:64]),
             InlineKeyboardButton("→", callback_data=f"{CB_ASK_RIGHT}{window_name}"[:64]),
-        ],
-        # Row 2: action keys
-        [
-            InlineKeyboardButton("⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_name}"[:64]),
-            InlineKeyboardButton("🔄", callback_data=f"{CB_ASK_REFRESH}{window_name}"[:64]),
-            InlineKeyboardButton("⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_name}"[:64]),
-        ],
+        ])
+    # Row 2: action keys
+    rows.append([
+        InlineKeyboardButton("⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_name}"[:64]),
+        InlineKeyboardButton("🔄", callback_data=f"{CB_ASK_REFRESH}{window_name}"[:64]),
+        InlineKeyboardButton("⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_name}"[:64]),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _handle_interactive_ui(
@@ -1387,8 +1428,9 @@ async def _handle_interactive_ui(
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
 
-    Handles AskUserQuestion, ExitPlanMode, and Permission Prompt UIs.
-    Returns True if UI was detected and sent, False otherwise.
+    Handles AskUserQuestion, ExitPlanMode, Permission Prompt, and
+    RestoreCheckpoint UIs. Returns True if UI was detected and sent,
+    False otherwise.
     """
     w = await tmux_manager.find_window_by_name(window_name)
     if not w:
@@ -1409,7 +1451,7 @@ async def _handle_interactive_ui(
         return False
 
     # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_name)
+    keyboard = _build_interactive_keyboard(window_name, ui_name=content.name)
 
     # Send as plain text (no markdown conversion)
     text = content.content
@@ -1423,6 +1465,7 @@ async def _handle_interactive_ui(
                 message_id=existing_msg_id,
                 text=text,
                 reply_markup=keyboard,
+                link_preview_options=_NO_LINK_PREVIEW,
             )
             _interactive_mode[user_id] = window_name
             return True
@@ -1437,6 +1480,7 @@ async def _handle_interactive_ui(
             chat_id=user_id,
             text=text,
             reply_markup=keyboard,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
         _interactive_msgs[user_id] = sent.message_id
         _interactive_mode[user_id] = window_name
@@ -1467,7 +1511,7 @@ def _get_interactive_window(user_id: int) -> str | None:
 
 
 def _build_response_parts(
-    window_name: str, text: str, is_complete: bool,
+    text: str, is_complete: bool,
     content_type: str = "text",
     role: str = "assistant",
 ) -> list[str]:
@@ -1606,7 +1650,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await _clear_interactive_msg(user_id, bot)
 
         parts = _build_response_parts(
-            wname, msg.text, msg.is_complete, msg.content_type, msg.role,
+            msg.text, msg.is_complete, msg.content_type, msg.role,
         )
 
         if msg.is_complete:
@@ -1620,7 +1664,6 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 parts=parts,
                 tool_use_id=msg.tool_use_id,
                 content_type=msg.content_type,
-                is_complete=True,
                 text=msg.text,
             )
 
@@ -1693,7 +1736,7 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global _status_poll_task
 
     # Stop status polling
     if _status_poll_task:

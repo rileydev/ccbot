@@ -1,4 +1,11 @@
-"""Configuration management for CCMux."""
+"""Application configuration — reads env vars and exposes a singleton.
+
+Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, and
+monitoring intervals from environment variables (with .env support).
+The module-level `config` instance is imported by nearly every other module.
+
+Key class: Config (singleton instantiated as `config`).
+"""
 
 import os
 from pathlib import Path

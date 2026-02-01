@@ -1,4 +1,10 @@
-"""Entry point for CCMux."""
+"""Application entry point — CLI dispatcher and bot bootstrap.
+
+Handles two execution modes:
+  1. `ccmux hook` — delegates to hook.hook_main() for Claude Code hook processing.
+  2. Default — configures logging, initializes tmux session, and starts the
+     Telegram bot polling loop via bot.create_bot().
+"""
 
 import logging
 import sys

@@ -1,7 +1,10 @@
-"""Monitor state persistence for session tracking.
+"""Monitor state persistence — tracks byte offsets for each session.
 
-Persists the state of monitored sessions to avoid re-sending
-notifications after restarts.
+Persists TrackedSession records (session_id, file_path, last_byte_offset)
+to ~/.ccmux/monitor_state.json so the session monitor can resume
+incremental reading after restarts without re-sending old messages.
+
+Key classes: MonitorState, TrackedSession.
 """
 
 from __future__ import annotations
@@ -22,7 +25,6 @@ class TrackedSession:
     session_id: str
     file_path: str  # Path to .jsonl file
     last_byte_offset: int = 0  # Byte offset for incremental reading
-    project_path: str = ""  # Working directory
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -35,7 +37,6 @@ class TrackedSession:
             session_id=data.get("session_id", ""),
             file_path=data.get("file_path", ""),
             last_byte_offset=data.get("last_byte_offset", 0),
-            project_path=data.get("project_path", ""),
         )
 
 

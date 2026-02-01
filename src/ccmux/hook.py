@@ -1,10 +1,13 @@
 """Hook subcommand for Claude Code session tracking.
 
-Called by Claude Code's SessionStart/SessionEnd hooks to maintain
-a window↔session mapping in ~/.ccmux/session_map.json.
+Called by Claude Code's SessionStart hook to maintain a window↔session
+mapping in ~/.ccmux/session_map.json. Also provides `--install` to
+auto-configure the hook in ~/.claude/settings.json.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
 since hooks run inside tmux panes where bot env vars are not set.
+
+Key functions: hook_main() (CLI entry), _install_hook().
 """
 
 import argparse

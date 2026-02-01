@@ -1,34 +1,42 @@
 # CLAUDE.md
 
-## 项目开发原则
+## Development Principles
 
-### 消息内容不做截断
+### No Message Truncation
 
-历史消息（tool_use 摘要、tool_result 文本、用户/助手消息）一律保留完整内容，不在解析层做任何字符数截断。长文本的处理统一交给发送层：通过 `split_message` 按 Telegram 4096 字符限制分页，配合 inline keyboard 翻页浏览。
+Historical messages (tool_use summaries, tool_result text, user/assistant messages) are always kept in full — no character-level truncation at the parsing layer. Long text is handled exclusively at the send layer: `split_message` paginates by Telegram's 4096-character limit, with inline keyboard navigation.
 
-### 历史分页默认显示最新内容
+### History Pagination Shows Latest First
 
-`/history` 默认显示最后一页（最新消息），用户通过 "◀ Older" 按钮向前翻阅更早的内容。
+`/history` defaults to the last page (newest messages). Users browse older content via the "◀ Older" button.
 
-### 遵循 Telegram Bot 最佳实践
+### Follow Telegram Bot Best Practices
 
-Bot 的交互设计应参考 Telegram Bot 平台的最佳实践：优先使用 inline keyboard 而非 reply keyboard；翻页/操作通过 `edit_message_text` 原地更新而非发送新消息；callback data 保持精简以适应 64 字节限制；合理使用 `answer_callback_query` 提供即时反馈。
+Interaction design follows Telegram Bot platform best practices: prefer inline keyboards over reply keyboards; use `edit_message_text` for in-place updates instead of sending new messages; keep callback data compact (64-byte limit); use `answer_callback_query` for instant feedback.
 
-### 代码质量检查
+### File Header Docstring Convention
 
-每次修改代码后运行 `pyright src/ccmux/` 检查类型错误，确保 0 errors 后再提交。
+Every Python source file must start with a module-level docstring (`"""..."""`) describing its core purpose. Requirements:
 
-### 消息格式化统一使用 MarkdownV2
+- **Purpose clear within 10 lines**: An AI or developer reading only the first 10 lines can determine the file's role, responsibilities, and key classes/functions.
+- **Structure**: First line is a one-sentence summary; subsequent lines describe core responsibilities, key components (class/function names), and relationships with other modules.
+- **Keep updated**: When a file undergoes major changes (adding/removing core features, changing module responsibilities, renaming key classes/functions), update the header docstring. Minor bug fixes or internal refactors do not require updates.
 
-所有发送到 Telegram 的消息统一使用 `parse_mode="MarkdownV2"`。通过 `telegramify-markdown` 库将标准 Markdown 转换为 Telegram MarkdownV2 格式。所有发送/编辑消息的调用都必须经过 `_safe_reply`/`_safe_edit`/`_safe_send` helper 函数，这些函数会自动完成 MarkdownV2 转换并在解析失败时 fallback 到纯文本。不要直接调用 `reply_text`/`edit_message_text`/`send_message`。
+### Code Quality Checks
 
-### 以 Window 为核心单位
+After every code change, run `pyright src/ccmux/` to check for type errors. Ensure 0 errors before committing.
 
-所有逻辑（session 列表、消息发送、历史查看、通知等）均以 tmux window 为核心单位进行处理，而非以项目目录（cwd）为单位。同一个目录可以有多个 window（名称自动加后缀如 `cc:project-2`），每个 window 独立关联自己的 Claude session。
+### Unified MarkdownV2 Formatting
 
-### 用户、窗口、会话的关联关系
+All messages sent to Telegram use `parse_mode="MarkdownV2"`. The `telegramify-markdown` library converts standard Markdown to Telegram MarkdownV2 format. All send/edit message calls must go through `_safe_reply`/`_safe_edit`/`_safe_send` helper functions, which handle MarkdownV2 conversion automatically and fall back to plain text on parse failure. Never call `reply_text`/`edit_message_text`/`send_message` directly.
 
-系统中有三个核心实体及其映射关系：
+### Window as the Core Unit
+
+All logic (session listing, message sending, history viewing, notifications) operates on tmux windows as the core unit, not project directories (cwd). Window names default to the directory name (e.g., `project`). The same directory can have multiple windows (auto-suffixed, e.g., `project-2`), each independently associated with its own Claude session.
+
+### User, Window, and Session Relationships
+
+Three core entities and their mappings:
 
 ```
 ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
@@ -36,130 +44,123 @@ Bot 的交互设计应参考 Telegram Bot 平台的最佳实践：优先使用 i
 │  (Telegram) │      │   (tmux)    │      │  (Claude)   │
 └─────────────┘      └─────────────┘      └─────────────┘
      active_sessions      session_map.json
-     (内存 + state.json)  (hook 写入)
+     (memory + state.json)  (written by hook)
 ```
 
-**映射 1: User → Window（用户活跃窗口）**
+**Mapping 1: User → Window (active window)**
 
 ```python
 # session.py: SessionManager
 active_sessions: dict[int, str]  # user_id → window_name
 ```
 
-- 存储位置：内存 + `~/.ccmux/state.json`
-- 写入时机：用户通过 `/list` 选择会话、创建新会话
-- 特性：**一个用户同时只有一个活跃窗口**（dict key 唯一性保证）
-- 用途：用户发消息时路由到正确的 tmux window
+- Storage: memory + `~/.ccmux/state.json`
+- Written when: user selects a session via `/list` or creates a new one
+- Property: **one user has exactly one active window** (guaranteed by dict key uniqueness)
+- Purpose: route user messages to the correct tmux window
 
-**映射 2: Window → Session（窗口会话绑定）**
+**Mapping 2: Window → Session (window-session binding)**
 
 ```python
-# session_map.json
+# session_map.json (key format: "tmux_session:window_name")
 {
-  "cc:project": {"session_id": "uuid-xxx", "cwd": "/path/to/project"},
-  "cc:project-2": {"session_id": "uuid-yyy", "cwd": "/path/to/project"}
+  "ccmux:project": {"session_id": "uuid-xxx", "cwd": "/path/to/project"},
+  "ccmux:project-2": {"session_id": "uuid-yyy", "cwd": "/path/to/project"}
 }
 ```
 
-- 存储位置：`~/.ccmux/session_map.json`
-- 写入时机：Claude Code 的 `SessionStart` hook 触发时
-- 特性：一个 window 对应一个 session；`/clear` 后 session_id 会变化
-- 用途：SessionMonitor 根据此映射决定监控哪些 session
+- Storage: `~/.ccmux/session_map.json`
+- Written when: Claude Code's `SessionStart` hook fires
+- Property: one window maps to one session; session_id changes after `/clear`
+- Purpose: SessionMonitor uses this mapping to decide which sessions to watch
 
-**消息发送流程**
-
-```
-用户发消息 "hello"
-    │
-    ▼
-active_sessions[user_id] → "cc:project"  (获取活跃窗口)
-    │
-    ▼
-send_to_window("cc:project", "hello")    (发送到 tmux)
-```
-
-**消息接收流程**
+**Outbound message flow**
 
 ```
-SessionMonitor 读取到新消息 (session_id = "uuid-xxx")
+User sends "hello"
     │
     ▼
-遍历 active_sessions，找到 window 对应此 session 的用户
+active_sessions[user_id] → "project"  (get active window)
     │
     ▼
-session_map["cc:project"].session_id == "uuid-xxx" ?
-    │
-    ▼
-如果用户的 active_window 是 "cc:project"，发送消息给该用户
-否则丢弃（用户已切换到其他窗口）
+send_to_window("project", "hello")    (send to tmux)
 ```
 
-**已知限制**：消息发送只看当前 active_window。用户切换窗口期间，旧窗口产生的消息会被 SessionMonitor 正常读取（offset 移动），但因 active_window 不匹配而不发送给用户。切换回来后，这些消息不会补发（已被读取过，offset 已移动）。
+**Inbound message flow**
 
-### Telegram Flood Control 防护
+```
+SessionMonitor reads new message (session_id = "uuid-xxx")
+    │
+    ▼
+Iterate active_sessions, find user whose window maps to this session
+    │
+    ▼
+session_map["ccmux:project"].session_id == "uuid-xxx" ?
+    │
+    ▼
+If user's active_window is "project", deliver message to user
+Otherwise discard (user has switched to another window)
+```
 
-Bot 实现了消息发送速率限制，避免触发 Telegram 的 flood control（频率限制）：
-- 每个用户的消息发送间隔至少 1.1 秒
-- Status 轮询间隔设为 1 秒（发送层有 rate limiting 保护）
-- 所有 `send_message` 调用都经过 `_rate_limit_send()` 检查并等待
+**Unread catch-up**: The system maintains per-user `user_window_offsets` (independent from SessionMonitor's offset), recording each user's last-read position per window. Messages produced while the user is on another window are not pushed in real time, but when the user switches back via `/list`, the unread range is automatically detected and displayed.
 
-### 消息队列架构
+### Telegram Flood Control Protection
 
-Bot 使用 per-user 消息队列 + worker 模式处理所有发送任务，确保：
-- 消息按接收顺序发送（FIFO）
-- Status 消息始终在 content 消息之后
-- 多用户并发处理互不干扰
+The bot implements send rate limiting to avoid triggering Telegram's flood control:
+- Minimum 1.1-second interval between messages per user
+- Status polling interval is 1 second (send layer has rate limiting protection)
+- All `send_message` calls go through `_rate_limit_send()` which checks and waits
 
-**消息合并**：Worker 出队时自动合并连续可合并的 content 消息，减少 API 调用：
-- 同一 window 的 content 消息可以合并（包括 text、thinking）
-- tool_use 中断合并链，单独发送（记录消息 ID 供后续编辑）
-- tool_result 中断合并链，单独编辑到 tool_use 消息（避免顺序错乱）
-- 合并后总长度超过 3800 字符时停止合并（避免分页）
+### Message Queue Architecture
 
-### Status 消息处理
+The bot uses per-user message queues + worker pattern for all send tasks, ensuring:
+- Messages are sent in receive order (FIFO)
+- Status messages always follow content messages
+- Multi-user concurrent processing without interference
 
-Status 消息（Claude 状态行）采用特殊处理优化用户体验：
+**Message merging**: The worker automatically merges consecutive mergeable content messages on dequeue, reducing API calls:
+- Content messages for the same window can be merged (including text, thinking)
+- tool_use breaks the merge chain and is sent separately (message ID recorded for later editing)
+- tool_result breaks the merge chain and is edited into the tool_use message (preventing order confusion)
+- Merging stops when combined length exceeds 3800 characters (to avoid pagination)
 
-**转换**：将 status 消息编辑为第一条 content 消息，减少消息数量：
-- 有 status 消息时，第一条 content 通过 edit 更新 status 消息
-- 后续 content 作为新消息发送
+### Status Message Handling
 
-**轮询**：后台任务以 1 秒间隔轮询所有 active window 的终端状态，发送层的 rate limiting 确保不会触发 flood control。
+Status messages (Claude status line) use special handling to optimize user experience:
 
-### Session 生命周期管理
+**Conversion**: The status message is edited into the first content message, reducing message count:
+- When a status message exists, the first content message updates it via edit
+- Subsequent content messages are sent as new messages
 
-Session monitor 通过 `session_map.json`（hook 写入）追踪 window → session_id 映射：
+**Polling**: A background task polls terminal status for all active windows at 1-second intervals. Send-layer rate limiting ensures flood control is not triggered.
 
-**启动清理**：Bot 启动时清理所有不在 session_map 中的 tracked session，避免监控已关闭的 session。
+### Session Lifecycle Management
 
-**运行时变更检测**：每次轮询时检测 session_map 变化：
-- Window 的 session_id 改变（如执行 `/clear`）→ 清理旧 session
-- Window 被删除 → 清理对应 session
+Session monitor tracks window → session_id mappings via `session_map.json` (written by hook):
 
-### 性能优化实践
+**Startup cleanup**: On bot startup, all tracked sessions not present in session_map are cleaned up, preventing monitoring of closed sessions.
 
-**mtime 缓存**：监控循环维护内存中的文件 mtime 缓存，跳过未修改的文件读取。
+**Runtime change detection**: Each polling cycle checks for session_map changes:
+- Window's session_id changed (e.g., after `/clear`) → clean up old session
+- Window deleted → clean up corresponding session
 
-**Byte offset 增量读取**：每个 tracked session 记录 `last_byte_offset`，只读取新增内容。检测文件截断（offset > file_size）自动重置。
+### Performance Optimizations
 
-**Status 去重**：入队前移除同 window 旧 status，减少队列占用和发送次数。
+**mtime cache**: The monitoring loop maintains an in-memory file mtime cache, skipping reads for unchanged files.
 
-### 多字体 Fallback
+**Byte offset incremental reads**: Each tracked session records `last_byte_offset`, reading only new content. File truncation (offset > file_size) is detected and offset is auto-reset.
 
-截图功能使用三级字体 fallback 链确保所有字符正确显示：
-1. **JetBrains Mono** — Latin、符号、box-drawing
-2. **Noto Sans Mono CJK SC** — 中日韩字符、全角标点
-3. **Symbola** — 其他特殊符号、dingbats
+**Status deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
 
-通过 `_font_tier()` 函数按字符 codepoint 判断使用哪级字体。支持完整的 ANSI 颜色解析（16 色 + 256 色 + RGB）。
+### Service Restart
 
-### 服务重启
+To restart the ccmux service after code changes, run `./scripts/restart.sh`. The script detects whether a running `uv run ccmux` process exists in the `__main__` window of tmux session `ccmux`, sends Ctrl-C to stop it, restarts, and outputs startup logs for confirmation.
 
-修改代码后需要重启 ccmux 服务时，执行 `./scripts/restart.sh`。脚本会自动检测 tmux session `ccmux` 的 `__main__` 窗口中是否有运行中的 `uv run ccmux` 进程，发送 Ctrl-C 停止后重新启动，并输出启动日志供确认。
+### Hook Configuration
 
-### Hook 配置
+Auto-install: `ccmux hook --install`
 
-用户需在 `~/.claude/settings.json` 中配置：
+Or manually configure in `~/.claude/settings.json`:
 
 ```json
 {

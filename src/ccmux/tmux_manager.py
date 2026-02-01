@@ -1,8 +1,14 @@
-"""Simplified tmux manager for discovering and sending to Claude Code sessions.
+"""Tmux session/window management via libtmux.
 
-Only provides functionality to:
-1. Discover tmux windows and their working directories
-2. Send keys to windows
+Wraps libtmux to provide async-friendly operations on a single tmux session:
+  - list_windows / find_window_by_name: discover Claude Code windows.
+  - capture_pane: read terminal content (plain or with ANSI colors).
+  - send_keys: forward user input or control keys to a window.
+  - create_window / kill_window: lifecycle management.
+
+All blocking libtmux calls are wrapped in asyncio.to_thread().
+
+Key class: TmuxManager (singleton instantiated as `tmux_manager`).
 """
 
 from __future__ import annotations
@@ -26,7 +32,6 @@ class TmuxWindow:
     window_id: str
     window_name: str
     cwd: str  # Current working directory
-    session_name: str
 
 
 class TmuxManager:
@@ -102,7 +107,6 @@ class TmuxManager:
                             window_id=window.window_id or "",
                             window_name=window.window_name or "",
                             cwd=cwd,
-                            session_name=self.session_name,
                         )
                     )
                 except Exception as e:

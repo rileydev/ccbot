@@ -1,4 +1,14 @@
-"""Convert terminal text to a PNG image."""
+"""Terminal text → PNG screenshot renderer.
+
+Converts captured tmux pane text (with optional ANSI color codes) into a
+dark-background PNG image. Supports full ANSI color parsing (16/256/RGB),
+bold text, and a three-tier font fallback chain:
+  1. JetBrains Mono — Latin, symbols, box-drawing
+  2. Noto Sans Mono CJK SC — CJK characters
+  3. Symbola — remaining special symbols
+
+Key function: text_to_image(text, font_size, with_ansi) → PNG bytes.
+"""
 
 from __future__ import annotations
 
@@ -69,7 +79,6 @@ class TextStyle:
     """Text styling information from ANSI codes."""
     fg_color: tuple[int, int, int] = _DEFAULT_FG
     bg_color: tuple[int, int, int] | None = None
-    bold: bool = False
 
 
 @dataclass
@@ -150,7 +159,6 @@ def _apply_ansi_codes(style: TextStyle, codes: str) -> TextStyle:
     new_style = TextStyle(
         fg_color=style.fg_color,
         bg_color=style.bg_color,
-        bold=style.bold,
     )
 
     parts = [int(c) for c in codes.split(';') if c]
@@ -160,10 +168,6 @@ def _apply_ansi_codes(style: TextStyle, codes: str) -> TextStyle:
 
         if code == 0:  # Reset
             new_style = TextStyle()
-        elif code == 1:  # Bold
-            new_style.bold = True
-        elif code == 22:  # Normal intensity
-            new_style.bold = False
         elif 30 <= code <= 37:  # Foreground color
             new_style.fg_color = _ANSI_COLORS[code - 30]
         elif code == 38:  # Extended foreground color

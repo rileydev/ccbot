@@ -1,10 +1,17 @@
-"""Claude Code session management.
+"""Claude Code session management — the core state hub.
 
-Manages active sessions and provides access to session information.
+Manages the two key mappings:
+  User→Window (active_sessions): which tmux window a user is talking to.
+  Window→Session (window_states): which Claude session_id a window holds.
 
-State is anchored to tmux window names (stable), not project paths (cwd, volatile).
-Each window stores:
-  - session_id: The associated Claude session ID (persisted)
+Responsibilities:
+  - Persist/load state to ~/.ccmux/state.json.
+  - Sync window↔session bindings from session_map.json (written by hook).
+  - Resolve window names to ClaudeSession objects (JSONL file reading).
+  - Track per-user read offsets for unread-message detection.
+  - Send keystrokes to tmux windows and retrieve message history.
+
+Key class: SessionManager (singleton instantiated as `session_manager`).
 """
 
 from __future__ import annotations
@@ -58,10 +65,7 @@ class ClaudeSession:
 
     session_id: str
     summary: str
-    project_path: str
-    first_prompt: str
     message_count: int
-    modified: str
     file_path: str
 
     @property
@@ -70,17 +74,6 @@ class ClaudeSession:
             return self.summary[:27] + "..."
         return self.summary
 
-    @property
-    def project_name(self) -> str:
-        return Path(self.project_path).name
-
-
-
-def _normalize_path(path: str) -> str:
-    try:
-        return str(Path(path).resolve())
-    except (OSError, ValueError):
-        return path
 
 
 @dataclass
@@ -90,7 +83,6 @@ class UnreadInfo:
     has_unread: bool
     start_offset: int  # User's last read offset
     end_offset: int  # Current file size
-    file_path: str
 
 
 @dataclass
@@ -230,13 +222,6 @@ class SessionManager:
             self.window_states[window_name] = WindowState()
         return self.window_states[window_name]
 
-    def set_window_session(self, window_name: str, session_id: str) -> None:
-        """Set the session ID for a window."""
-        state = self.get_window_state(window_name)
-        state.session_id = session_id
-        self._save_state()
-        logger.info(f"Set window {window_name} -> session {session_id}")
-
     def clear_window_session(self, window_name: str) -> None:
         """Clear session association for a window (e.g., after /clear command)."""
         state = self.get_window_state(window_name)
@@ -250,8 +235,6 @@ class SessionManager:
             return None
         # Encode cwd: /data/code/ccmux -> -data-code-ccmux
         encoded_cwd = cwd.replace("/", "-")
-        if encoded_cwd.startswith("-"):
-            encoded_cwd = encoded_cwd  # Keep leading dash
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
     async def _get_session_direct(
@@ -304,10 +287,7 @@ class SessionManager:
         return ClaudeSession(
             session_id=session_id,
             summary=summary,
-            project_path=cwd,
-            first_prompt="",
             message_count=message_count,
-            modified="",
             file_path=str(file_path),
         )
 
@@ -370,18 +350,6 @@ class SessionManager:
     def get_active_window_name(self, user_id: int) -> str | None:
         return self.active_sessions.get(user_id)
 
-    async def get_active_window(self, user_id: int) -> TmuxWindow | None:
-        name = self.get_active_window_name(user_id)
-        if not name:
-            return None
-        return await tmux_manager.find_window_by_name(name)
-
-    async def get_active_cwd(self, user_id: int) -> str | None:
-        window = await self.get_active_window(user_id)
-        if window:
-            return _normalize_path(window.cwd)
-        return None
-
     def clear_active_session(self, user_id: int) -> None:
         if user_id in self.active_sessions:
             del self.active_sessions[user_id]
@@ -438,7 +406,6 @@ class SessionManager:
                 has_unread=False,
                 start_offset=file_size,
                 end_offset=file_size,
-                file_path=str(file_path),
             )
 
         # Detect file truncation (e.g., after /clear)
@@ -451,7 +418,6 @@ class SessionManager:
             has_unread=has_unread,
             start_offset=user_offset,
             end_offset=file_size,
-            file_path=str(file_path),
         )
 
     # --- Tmux helpers ---
@@ -477,8 +443,6 @@ class SessionManager:
     async def get_recent_messages(
         self,
         window_name: str,
-        count: int = 5,
-        offset: int = 0,
         *,
         start_byte: int = 0,
         end_byte: int | None = None,
@@ -533,19 +497,7 @@ class SessionManager:
             for e in parsed_entries
         ]
 
-        total = len(all_messages)
-        if total == 0:
-            return [], 0
-
-        if count == 0:
-            return all_messages, total
-
-        end_idx = total - offset
-        start_idx = max(0, end_idx - count)
-        if end_idx <= 0:
-            return [], total
-
-        return all_messages[start_idx:end_idx], total
+        return all_messages, len(all_messages)
 
 
 session_manager = SessionManager()

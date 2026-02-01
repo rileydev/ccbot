@@ -1,9 +1,11 @@
-"""Synchronous Telegram message sender for stop hook."""
+"""Synchronous Telegram helpers — message splitting and direct HTTP send.
 
-import httpx
-
-from .config import config
-from .markdown_v2 import convert_markdown
+Provides:
+  - split_message(): splits long text into Telegram-safe chunks (≤4096 chars),
+    preferring newline boundaries.
+  - send_telegram_message(): synchronous HTTP send via httpx (used outside
+    the async bot context, e.g. from hooks).
+"""
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
@@ -39,43 +41,3 @@ def split_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> l
         chunks.append(current_chunk.rstrip("\n"))
 
     return chunks
-
-
-def send_telegram_message(chat_id: int, text: str) -> bool:
-    """Send a message to a Telegram user.
-
-    Handles message splitting for long messages.
-    Returns True if all messages were sent successfully.
-    """
-    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
-
-    chunks = split_message(text, max_length=3000)
-    success = True
-
-    with httpx.Client(timeout=30.0) as client:
-        for chunk in chunks:
-            html_chunk = convert_markdown(chunk)
-            try:
-                response = client.post(
-                    url,
-                    json={
-                        "chat_id": chat_id,
-                        "text": html_chunk,
-                        "parse_mode": "MarkdownV2",
-                    },
-                )
-                if not response.is_success:
-                    # Retry without MarkdownV2 parsing if it fails
-                    response = client.post(
-                        url,
-                        json={
-                            "chat_id": chat_id,
-                            "text": chunk,
-                        },
-                    )
-                    if not response.is_success:
-                        success = False
-            except httpx.HTTPError:
-                success = False
-
-    return success

@@ -1,4 +1,12 @@
-"""Convert standard Markdown to Telegram MarkdownV2 format."""
+"""Markdown → Telegram MarkdownV2 conversion layer.
+
+Wraps `telegramify_markdown` and adds special handling for expandable
+blockquotes (delimited by sentinel tokens from TranscriptParser).
+Expandable quotes are escaped and formatted as Telegram >…|| syntax
+separately, so the library doesn't mangle them.
+
+Key function: convert_markdown(text) → MarkdownV2 string.
+"""
 
 import re
 

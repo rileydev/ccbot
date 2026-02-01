@@ -1,8 +1,14 @@
-"""Session monitoring service for Claude Code sessions.
+"""Session monitoring service — watches JSONL files for new messages.
 
-Uses async polling with aiofiles for non-blocking file I/O.
-Emits both intermediate (streaming) and complete messages to enable
-real-time Telegram updates.
+Runs an async polling loop that:
+  1. Loads the current session_map to know which sessions to watch.
+  2. Detects session_map changes (new/changed/deleted windows) and cleans up.
+  3. Reads new JSONL lines from each session file using byte-offset tracking.
+  4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
+
+Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
+
+Key classes: SessionMonitor, NewMessage, SessionInfo.
 """
 
 from __future__ import annotations
@@ -31,8 +37,6 @@ class SessionInfo:
 
     session_id: str
     file_path: Path
-    file_mtime: float
-    project_path: str
 
 
 @dataclass
@@ -40,11 +44,8 @@ class NewMessage:
     """A new message detected by the monitor."""
 
     session_id: str
-    project_path: str
     text: str
-    uuid: str | None
     is_complete: bool  # True when stop_reason is set (final message)
-    msg_id: str | None = None  # API message ID (same across streaming chunks)
     content_type: str = "text"  # "text" or "thinking"
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
@@ -128,7 +129,6 @@ class SessionMonitor:
                     for entry in entries:
                         session_id = entry.get("sessionId", "")
                         full_path = entry.get("fullPath", "")
-                        file_mtime = entry.get("fileMtime", 0)
                         project_path = entry.get("projectPath", original_path)
 
                         if not session_id or not full_path:
@@ -147,8 +147,6 @@ class SessionMonitor:
                             sessions.append(SessionInfo(
                                 session_id=session_id,
                                 file_path=file_path,
-                                file_mtime=file_mtime,
-                                project_path=project_path,
                             ))
 
                 except (json.JSONDecodeError, OSError) as e:
@@ -178,15 +176,9 @@ class SessionMonitor:
                     if norm_fp not in active_cwds:
                         continue
 
-                    try:
-                        file_mtime = jsonl_file.stat().st_mtime
-                    except OSError:
-                        continue
                     sessions.append(SessionInfo(
                         session_id=session_id,
                         file_path=jsonl_file,
-                        file_mtime=file_mtime,
-                        project_path=file_project_path,
                     ))
             except OSError as e:
                 logger.debug(f"Error scanning jsonl files in {project_dir}: {e}")
@@ -266,7 +258,6 @@ class SessionMonitor:
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
                         last_byte_offset=file_size,
-                        project_path=session_info.project_path,
                     )
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime
@@ -312,9 +303,7 @@ class SessionMonitor:
                         continue
                     new_messages.append(NewMessage(
                         session_id=session_info.session_id,
-                        project_path=session_info.project_path,
                         text=entry.text,
-                        uuid=None,
                         is_complete=True,
                         content_type=entry.content_type,
                         tool_use_id=entry.tool_use_id,
@@ -322,7 +311,6 @@ class SessionMonitor:
                         tool_name=entry.tool_name,
                     ))
 
-                tracked.project_path = session_info.project_path
                 self.state.update_session(tracked)
 
             except OSError as e:

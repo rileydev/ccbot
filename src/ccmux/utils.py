@@ -1,15 +1,17 @@
-"""Shared utility functions for CCMux."""
+"""Shared utility functions used across multiple CCMux modules.
+
+Provides:
+  - atomic_write_json(): crash-safe JSON file writes via temp+rename.
+  - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
+"""
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
