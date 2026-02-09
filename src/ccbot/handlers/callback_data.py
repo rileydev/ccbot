@@ -39,3 +39,6 @@ CB_ASK_REFRESH = "aq:ref:" # aq:ref:<window>
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
 
+# Restart Claude Code
+CB_RESTART = "rs:"  # rs:<window>
+

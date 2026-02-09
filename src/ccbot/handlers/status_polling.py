@@ -3,6 +3,7 @@
 Provides background polling of terminal status lines for all active users:
   - Detects Claude Code status (working, waiting, etc.)
   - Detects interactive UIs (permission prompts) not triggered via JSONL
+  - Detects Claude Code process exit and notifies user with restart button
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
   - Periodically probes topic existence via unpin_all_forum_topic_messages
@@ -14,18 +15,23 @@ Key components:
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
+  - set_expected_command / clear_expected_command: Track expected pane process
+  - handle_restart_button: Restart CC when user clicks the inline button
 """
 
 import asyncio
 import logging
+import shlex
 import time
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
+from .callback_data import CB_RESTART
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
@@ -33,6 +39,7 @@ from .interactive_ui import (
 )
 from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import safe_send
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +48,91 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Module-level state for CC exit detection
+_expected_commands: dict[str, str] = {}  # window_name → expected pane_current_command
+_exit_notified: dict[str, str] = {}  # window_name → shell command at exit time
+
+
+def _restart_command() -> str:
+    """Return claude command with -c (continue) flag added for restart.
+
+    Inspects config.claude_command; if it already contains -c or --continue,
+    returns it unchanged.  Otherwise inserts -c after the program name.
+    """
+    parts = shlex.split(config.claude_command)
+    for part in parts:
+        if part in ("-c", "--continue"):
+            return config.claude_command
+        # Combined short flags like -cm
+        if part.startswith("-") and not part.startswith("--") and "c" in part:
+            return config.claude_command
+    parts.append("-c")
+    return shlex.join(parts)
+
+
+def set_expected_command(window_name: str, command: str) -> None:
+    """Record the expected pane command for a window (called after CC starts)."""
+    _expected_commands[window_name] = command
+    _exit_notified.pop(window_name, None)
+    logger.debug("Set expected command for window '%s': %s", window_name, command)
+
+
+def clear_expected_command(window_name: str) -> None:
+    """Remove expected command tracking for a window (called on unbind/cleanup)."""
+    _expected_commands.pop(window_name, None)
+    _exit_notified.pop(window_name, None)
+
+
+async def _notify_cc_exit(
+    bot: Bot,
+    user_id: int,
+    thread_id: int,
+    window_name: str,
+    shell_cmd: str,
+) -> None:
+    """Send exit notification with restart button and command text."""
+    _exit_notified[window_name] = shell_cmd
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    cmd = _restart_command()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔄 Restart",
+            callback_data=f"{CB_RESTART}{window_name}"[:64],
+        ),
+    ]])
+    await safe_send(
+        bot, chat_id,
+        f"⚠ Claude Code exited.\n\nRestart command: `{cmd}`\n\n"
+        "Tap Restart or send a custom command.",
+        message_thread_id=thread_id,
+        reply_markup=keyboard,
+    )
+    logger.info("CC exit notification sent for window '%s' (shell=%s)", window_name, shell_cmd)
+
+
+async def handle_restart_button(
+    bot: Bot,
+    window_name: str,
+) -> bool:
+    """Restart Claude Code via button click. Returns True if successful."""
+    cmd = _restart_command()
+    success = await tmux_manager.restart_claude_in_window(window_name, cmd)
+    if not success:
+        logger.warning("Failed to restart Claude in window '%s'", window_name)
+        return False
+
+    _exit_notified.pop(window_name, None)
+    logger.info("Button-restart of Claude Code in window '%s' (cmd=%s)", window_name, cmd)
+
+    # Wait for session_map entry and re-record expected command
+    found = await session_manager.wait_for_session_map_entry(window_name)
+    if found:
+        w = await tmux_manager.find_window_by_name(window_name)
+        if w and w.pane_current_command:
+            _expected_commands[window_name] = w.pane_current_command
+
+    return True
 
 
 async def update_status_message(
@@ -146,6 +238,7 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_name(wname)
                     if not w:
+                        clear_expected_command(wname)
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
@@ -153,6 +246,35 @@ async def status_poll_loop(bot: Bot) -> None:
                             f"thread={thread_id} window={wname}"
                         )
                         continue
+
+                    # Detect CC process exit / recovery
+                    if wname in _expected_commands:
+                        if w.pane_current_command != _expected_commands[wname]:
+                            # CC has exited — notify once
+                            if wname not in _exit_notified:
+                                await _notify_cc_exit(
+                                    bot, user_id, thread_id, wname,
+                                    w.pane_current_command,
+                                )
+                            continue  # Skip status update while CC is down
+                        elif wname in _exit_notified:
+                            # CC is back (user manually restarted)
+                            _exit_notified.pop(wname, None)
+                            # Re-record in case process name changed
+                            _expected_commands[wname] = w.pane_current_command
+                            logger.info(
+                                "CC recovered in window '%s' (cmd=%s)",
+                                wname, w.pane_current_command,
+                            )
+                            chat_id = session_manager.resolve_chat_id(
+                                user_id, thread_id,
+                            )
+                            await safe_send(
+                                bot, chat_id,
+                                f"✅ Claude Code restarted in *{wname}*.",
+                                message_thread_id=thread_id,
+                            )
+
                     queue = get_message_queue(user_id)
                     if queue and not queue.empty():
                         continue

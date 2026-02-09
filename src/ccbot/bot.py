@@ -70,6 +70,7 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
+    CB_RESTART,
     CB_SCREENSHOT_REFRESH,
 )
 from .handlers.directory_browser import (
@@ -100,7 +101,12 @@ from .handlers.message_queue import (
 )
 from .handlers.message_sender import safe_edit, safe_reply, safe_send
 from .handlers.response_builder import build_response_parts
-from .handlers.status_polling import status_poll_loop
+from .handlers.status_polling import (
+    clear_expected_command,
+    handle_restart_button,
+    set_expected_command,
+    status_poll_loop,
+)
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -287,6 +293,7 @@ async def topic_closed_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     wname = session_manager.get_window_for_thread(user.id, thread_id)
     if wname:
+        clear_expected_command(wname)
         w = await tmux_manager.find_window_by_name(wname)
         if w:
             await tmux_manager.kill_window(w.window_id)
@@ -382,13 +389,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = update.message.text
     thread_id = _get_thread_id(update)
 
-    # Ignore text in directory browsing mode
+    # Ignore text in directory browsing mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
-        await safe_reply(
-            update.message,
-            "Please use the directory browser above, or tap Cancel.",
-        )
-        return
+        pending_tid = context.user_data.get("_pending_thread_id")
+        if pending_tid == thread_id:
+            await safe_reply(
+                update.message,
+                "Please use the directory browser above, or tap Cancel.",
+            )
+            return
+        # Stale browsing state from a different thread — clear it
+        clear_browse_state(context.user_data)
+        context.user_data.pop("_pending_thread_id", None)
+        context.user_data.pop("_pending_thread_text", None)
 
     # Must be in a named topic
     if thread_id is None:
@@ -417,6 +430,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Bound topic — forward to bound window
     w = await tmux_manager.find_window_by_name(wname)
     if not w:
+        clear_expected_command(wname)
         logger.info("Stale binding: window %s gone, unbinding (user=%d, thread=%d)", wname, user.id, thread_id)
         session_manager.unbind_thread(user.id, thread_id)
         await safe_reply(
@@ -584,6 +598,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             # Wait for Claude Code's SessionStart hook to register in session_map
             await session_manager.wait_for_session_map_entry(created_wname)
+
+            # Record expected pane command for auto-restart detection
+            w_info = await tmux_manager.find_window_by_name(created_wname)
+            if w_info and w_info.pane_current_command:
+                set_expected_command(created_wname, w_info.pane_current_command)
 
             if pending_thread_id is not None:
                 # Thread bind flow: bind thread to newly created window
@@ -804,6 +823,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass  # Screenshot unchanged or message too old
 
+    # Restart Claude Code button
+    elif data.startswith(CB_RESTART):
+        window_name = data[len(CB_RESTART):]
+        w = await tmux_manager.find_window_by_name(window_name)
+        if not w:
+            await safe_edit(query, "❌ Window no longer exists.")
+            await query.answer("Window gone", show_alert=True)
+            return
+
+        await query.answer("Restarting...")
+        success = await handle_restart_button(context.bot, window_name)
+        if success:
+            await safe_edit(query, f"✅ Claude Code restarted in *{window_name}*.")
+        else:
+            await safe_edit(query, "❌ Failed to restart Claude Code.")
+
 
 # --- Streaming response / notifications ---
 
@@ -917,6 +952,12 @@ async def post_init(application: Application) -> None:
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
+
+    # Restore expected commands for existing bindings (bot restart recovery)
+    for _uid, _tid, wname in session_manager.iter_thread_bindings():
+        w = await tmux_manager.find_window_by_name(wname)
+        if w and w.pane_current_command:
+            set_expected_command(wname, w.pane_current_command)
 
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
