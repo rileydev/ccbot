@@ -62,13 +62,13 @@ UI_PATTERNS: list[UIPattern] = [
     ),
     UIPattern(
         name="AskUserQuestion",
-        top=(re.compile(r"^\s*←\s+[☐✔]"),),   # Multi-tab: no bottom needed
+        top=(re.compile(r"^\s*←\s+[☐✔☒]"),),   # Multi-tab: no bottom needed
         bottom=(),
         min_gap=1,
     ),
     UIPattern(
         name="AskUserQuestion",
-        top=(re.compile(r"^\s*[☐✔]"),),        # Single-tab: bottom required
+        top=(re.compile(r"^\s*[☐✔☒]"),),        # Single-tab: bottom required
         bottom=(re.compile(r"^\s*Enter to select"),),
         min_gap=1,
     ),
