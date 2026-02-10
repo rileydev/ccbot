@@ -91,11 +91,32 @@ class TmuxManager:
             if not session:
                 return windows
 
+            seen_names: set[str] = set()
             for window in session.windows:
                 name = window.window_name or ""
                 # Skip the main window (placeholder window)
                 if name == config.tmux_main_window_name:
                     continue
+
+                # Auto-rename duplicate window names (same suffix as create_window)
+                if name in seen_names:
+                    base_name = name
+                    counter = 2
+                    while f"{base_name}-{counter}" in seen_names:
+                        counter += 1
+                    new_name = f"{base_name}-{counter}"
+                    try:
+                        window.rename_window(new_name)
+                        logger.info(
+                            "Renamed duplicate window '%s' → '%s'", name, new_name
+                        )
+                        name = new_name
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to rename duplicate window '%s': %s", name, e
+                        )
+                seen_names.add(name)
+
                 try:
                     # Get the active pane's current path and command
                     pane = window.active_pane
@@ -109,7 +130,7 @@ class TmuxManager:
                     windows.append(
                         TmuxWindow(
                             window_id=window.window_id or "",
-                            window_name=window.window_name or "",
+                            window_name=name,
                             cwd=cwd,
                             pane_current_command=pane_cmd,
                         )

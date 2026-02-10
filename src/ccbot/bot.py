@@ -71,6 +71,9 @@ from .handlers.callback_data import (
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
+    CB_WIN_BIND,
+    CB_WIN_CANCEL,
+    CB_WIN_NEW,
 )
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
@@ -78,8 +81,12 @@ from .handlers.directory_browser import (
     BROWSE_PATH_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_WINDOW,
+    UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_window_picker,
     clear_browse_state,
+    clear_window_picker_state,
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
@@ -409,6 +416,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text
 
+    # Ignore text in window picker mode (only for the same thread)
+    if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
+        pending_tid = context.user_data.get("_pending_thread_id")
+        if pending_tid == thread_id:
+            await safe_reply(
+                update.message,
+                "Please use the window picker above, or tap Cancel.",
+            )
+            return
+        # Stale picker state from a different thread — clear it
+        clear_window_picker_state(context.user_data)
+        context.user_data.pop("_pending_thread_id", None)
+        context.user_data.pop("_pending_thread_text", None)
+
     # Ignore text in directory browsing mode (only for the same thread)
     if (
         context.user_data
@@ -436,7 +457,41 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     wname = session_manager.get_window_for_thread(user.id, thread_id)
     if wname is None:
-        # Unbound topic — show directory browser to create a new session
+        # Unbound topic — check for unbound windows first
+        all_windows = await tmux_manager.list_windows()
+        bound_names: set[str] = set()
+        for _, _, bw in session_manager.iter_thread_bindings():
+            bound_names.add(bw)
+        unbound = [
+            (w.window_name, w.cwd)
+            for w in all_windows
+            if w.window_name not in bound_names
+        ]
+        logger.debug(
+            "Window picker check: all=%s, bound=%s, unbound=%s",
+            [w.window_name for w in all_windows],
+            bound_names,
+            [name for name, _ in unbound],
+        )
+
+        if unbound:
+            # Show window picker
+            logger.info(
+                "Unbound topic: showing window picker (%d unbound windows, user=%d, thread=%d)",
+                len(unbound),
+                user.id,
+                thread_id,
+            )
+            msg_text, keyboard, win_names = build_window_picker(unbound)
+            if context.user_data is not None:
+                context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+                context.user_data[UNBOUND_WINDOWS_KEY] = win_names
+                context.user_data["_pending_thread_id"] = thread_id
+                context.user_data["_pending_thread_text"] = text
+            await safe_reply(update.message, msg_text, reply_markup=keyboard)
+            return
+
+        # No unbound windows — show directory browser to create a new session
         logger.info(
             "Unbound topic: showing directory browser (user=%d, thread=%d)",
             user.id,
@@ -758,6 +813,115 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
         clear_browse_state(context.user_data)
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+        await safe_edit(query, "Cancelled")
+        await query.answer("Cancelled")
+
+    # Window picker: bind existing window
+    elif data.startswith(CB_WIN_BIND):
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        try:
+            idx = int(data[len(CB_WIN_BIND) :])
+        except ValueError:
+            await query.answer("Invalid data")
+            return
+
+        cached_windows: list[str] = (
+            context.user_data.get(UNBOUND_WINDOWS_KEY, []) if context.user_data else []
+        )
+        if idx < 0 or idx >= len(cached_windows):
+            await query.answer("Window list changed, please retry", show_alert=True)
+            return
+        selected_window = cached_windows[idx]
+
+        # Verify window still exists
+        w = await tmux_manager.find_window_by_name(selected_window)
+        if not w:
+            await query.answer(
+                f"Window '{selected_window}' no longer exists", show_alert=True
+            )
+            return
+
+        thread_id = _get_thread_id(update)
+        if thread_id is None:
+            await query.answer("Not in a topic", show_alert=True)
+            return
+
+        clear_window_picker_state(context.user_data)
+        session_manager.bind_thread(user.id, thread_id, selected_window)
+
+        # Rename the topic to match the window name
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=session_manager.resolve_chat_id(user.id, thread_id),
+                message_thread_id=thread_id,
+                name=selected_window,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to rename topic: {e}")
+
+        await safe_edit(
+            query,
+            f"✅ Bound to window `{selected_window}`",
+        )
+
+        # Forward pending text if any
+        pending_text = (
+            context.user_data.get("_pending_thread_text") if context.user_data else None
+        )
+        if context.user_data is not None:
+            context.user_data.pop("_pending_thread_text", None)
+            context.user_data.pop("_pending_thread_id", None)
+        if pending_text:
+            send_ok, send_msg = await session_manager.send_to_window(
+                selected_window, pending_text
+            )
+            if not send_ok:
+                logger.warning("Failed to forward pending text: %s", send_msg)
+                await safe_send(
+                    context.bot,
+                    session_manager.resolve_chat_id(user.id, thread_id),
+                    f"❌ Failed to send pending message: {send_msg}",
+                    message_thread_id=thread_id,
+                )
+        await query.answer("Bound")
+
+    # Window picker: new session → transition to directory browser
+    elif data == CB_WIN_NEW:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        # Preserve pending thread info, clear only picker state
+        clear_window_picker_state(context.user_data)
+        start_path = str(Path.cwd())
+        msg_text, keyboard, subdirs = build_directory_browser(start_path)
+        if context.user_data is not None:
+            context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+            context.user_data[BROWSE_PATH_KEY] = start_path
+            context.user_data[BROWSE_PAGE_KEY] = 0
+            context.user_data[BROWSE_DIRS_KEY] = subdirs
+        await safe_edit(query, msg_text, reply_markup=keyboard)
+        await query.answer()
+
+    # Window picker: cancel
+    elif data == CB_WIN_CANCEL:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        clear_window_picker_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)

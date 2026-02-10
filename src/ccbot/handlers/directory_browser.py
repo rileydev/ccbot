@@ -1,14 +1,15 @@
-"""Directory browser UI for selecting working directories.
+"""Directory browser and window picker UI for session creation.
 
-Provides a visual directory browser in Telegram for:
-  - Navigating directory hierarchies
-  - Selecting a working directory for new Claude sessions
-  - Paginated display of subdirectories
+Provides UIs in Telegram for:
+  - Window picker: list unbound tmux windows for quick binding
+  - Directory browser: navigate directory hierarchies to create new sessions
 
 Key components:
   - DIRS_PER_PAGE: Number of directories shown per page
-  - User state keys for tracking browse session
+  - User state keys for tracking browse/picker session
+  - build_window_picker: Build unbound window picker UI
   - build_directory_browser: Build directory browser UI
+  - clear_window_picker_state: Clear picker state from user_data
   - clear_browse_state: Clear browsing state from user_data
 """
 
@@ -22,6 +23,9 @@ from .callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_WIN_BIND,
+    CB_WIN_CANCEL,
+    CB_WIN_NEW,
 )
 
 # Directories per page in directory browser
@@ -30,9 +34,11 @@ DIRS_PER_PAGE = 6
 # User state keys
 STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
+STATE_SELECTING_WINDOW = "selecting_window"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
+UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -42,6 +48,58 @@ def clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(BROWSE_PATH_KEY, None)
         user_data.pop(BROWSE_PAGE_KEY, None)
         user_data.pop(BROWSE_DIRS_KEY, None)
+
+
+def clear_window_picker_state(user_data: dict | None) -> None:
+    """Clear window picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(UNBOUND_WINDOWS_KEY, None)
+
+
+def build_window_picker(
+    windows: list[tuple[str, str]],
+) -> tuple[str, InlineKeyboardMarkup, list[str]]:
+    """Build window picker UI for unbound tmux windows.
+
+    Args:
+        windows: List of (window_name, cwd) tuples.
+
+    Returns: (text, keyboard, window_names) where window_names is the ordered list for caching.
+    """
+    window_names = [name for name, _ in windows]
+
+    lines = [
+        "*Bind to Existing Window*\n",
+        "These windows are running but not bound to any topic.",
+        "Pick one to attach it here, or start a new session.\n",
+    ]
+    for i, (name, cwd) in enumerate(windows):
+        display_cwd = cwd.replace(str(Path.home()), "~")
+        lines.append(f"• `{name}` — {display_cwd}")
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(windows), 2):
+        row = []
+        for j in range(min(2, len(windows) - i)):
+            name = windows[i + j][0]
+            display = name[:12] + "…" if len(name) > 13 else name
+            row.append(
+                InlineKeyboardButton(
+                    f"🖥 {display}", callback_data=f"{CB_WIN_BIND}{i + j}"
+                )
+            )
+        buttons.append(row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton("➕ New Session", callback_data=CB_WIN_NEW),
+            InlineKeyboardButton("Cancel", callback_data=CB_WIN_CANCEL),
+        ]
+    )
+
+    text = "\n".join(lines)
+    return text, InlineKeyboardMarkup(buttons), window_names
 
 
 def build_directory_browser(

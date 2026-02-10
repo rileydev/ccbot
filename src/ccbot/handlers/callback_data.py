@@ -6,6 +6,7 @@ Each prefix identifies a specific action or navigation target.
 Constants:
   - CB_HISTORY_*: History pagination
   - CB_DIR_*: Directory browser navigation
+  - CB_WIN_*: Window picker (bind existing unbound window)
   - CB_SCREENSHOT_*: Screenshot refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
@@ -21,6 +22,11 @@ CB_DIR_UP = "db:up"
 CB_DIR_CONFIRM = "db:confirm"
 CB_DIR_CANCEL = "db:cancel"
 CB_DIR_PAGE = "db:page:"
+
+# Window picker (bind existing unbound window)
+CB_WIN_BIND = "wb:sel:"  # wb:sel:<index>
+CB_WIN_NEW = "wb:new"  # proceed to directory browser
+CB_WIN_CANCEL = "wb:cancel"
 
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"
