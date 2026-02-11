@@ -14,11 +14,11 @@ def mgr(monkeypatch) -> SessionManager:
 
 class TestThreadBindings:
     def test_bind_and_get(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 1, "myproject")
-        assert mgr.get_window_for_thread(100, 1) == "myproject"
+        mgr.bind_thread(100, 1, "@1")
+        assert mgr.get_window_for_thread(100, 1) == "@1"
 
     def test_bind_unbind_get_returns_none(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 1, "myproject")
+        mgr.bind_thread(100, 1, "@1")
         mgr.unbind_thread(100, 1)
         assert mgr.get_window_for_thread(100, 1) is None
 
@@ -26,15 +26,15 @@ class TestThreadBindings:
         assert mgr.unbind_thread(100, 999) is None
 
     def test_get_thread_for_window(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 42, "editor")
-        assert mgr.get_thread_for_window(100, "editor") == 42
+        mgr.bind_thread(100, 42, "@5")
+        assert mgr.get_thread_for_window(100, "@5") == 42
 
     def test_iter_thread_bindings(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 1, "proj-a")
-        mgr.bind_thread(100, 2, "proj-b")
-        mgr.bind_thread(200, 3, "proj-c")
+        mgr.bind_thread(100, 1, "@1")
+        mgr.bind_thread(100, 2, "@2")
+        mgr.bind_thread(200, 3, "@3")
         result = set(mgr.iter_thread_bindings())
-        assert result == {(100, 1, "proj-a"), (100, 2, "proj-b"), (200, 3, "proj-c")}
+        assert result == {(100, 1, "@1"), (100, 2, "@2"), (200, 3, "@3")}
 
 
 class TestResolveChatId:
@@ -52,20 +52,20 @@ class TestResolveChatId:
 
 class TestWindowState:
     def test_get_creates_new(self, mgr: SessionManager) -> None:
-        state = mgr.get_window_state("new-window")
+        state = mgr.get_window_state("@0")
         assert state.session_id == ""
         assert state.cwd == ""
 
     def test_get_returns_existing(self, mgr: SessionManager) -> None:
-        state = mgr.get_window_state("win")
+        state = mgr.get_window_state("@1")
         state.session_id = "abc"
-        assert mgr.get_window_state("win").session_id == "abc"
+        assert mgr.get_window_state("@1").session_id == "abc"
 
     def test_clear_window_session(self, mgr: SessionManager) -> None:
-        state = mgr.get_window_state("win")
+        state = mgr.get_window_state("@1")
         state.session_id = "abc"
-        mgr.clear_window_session("win")
-        assert mgr.get_window_state("win").session_id == ""
+        mgr.clear_window_session("@1")
+        assert mgr.get_window_state("@1").session_id == ""
 
 
 class TestResolveWindowForThread:
@@ -76,5 +76,42 @@ class TestResolveWindowForThread:
         assert mgr.resolve_window_for_thread(100, 42) is None
 
     def test_bound_thread_returns_window(self, mgr: SessionManager) -> None:
-        mgr.bind_thread(100, 42, "proj")
-        assert mgr.resolve_window_for_thread(100, 42) == "proj"
+        mgr.bind_thread(100, 42, "@3")
+        assert mgr.resolve_window_for_thread(100, 42) == "@3"
+
+
+class TestDisplayNames:
+    def test_get_display_name_fallback(self, mgr: SessionManager) -> None:
+        """get_display_name returns window_id when no display name is set."""
+        assert mgr.get_display_name("@99") == "@99"
+
+    def test_set_and_get_display_name(self, mgr: SessionManager) -> None:
+        mgr.set_display_name("@1", "myproject")
+        assert mgr.get_display_name("@1") == "myproject"
+
+    def test_set_display_name_update(self, mgr: SessionManager) -> None:
+        mgr.set_display_name("@1", "old-name")
+        mgr.set_display_name("@1", "new-name")
+        assert mgr.get_display_name("@1") == "new-name"
+
+    def test_bind_thread_sets_display_name(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1", window_name="proj")
+        assert mgr.get_display_name("@1") == "proj"
+
+    def test_bind_thread_without_name_no_display(self, mgr: SessionManager) -> None:
+        mgr.bind_thread(100, 1, "@1")
+        # No display name set, fallback to window_id
+        assert mgr.get_display_name("@1") == "@1"
+
+
+class TestIsWindowId:
+    def test_valid_ids(self, mgr: SessionManager) -> None:
+        assert mgr._is_window_id("@0") is True
+        assert mgr._is_window_id("@12") is True
+        assert mgr._is_window_id("@999") is True
+
+    def test_invalid_ids(self, mgr: SessionManager) -> None:
+        assert mgr._is_window_id("myproject") is False
+        assert mgr._is_window_id("@") is False
+        assert mgr._is_window_id("") is False
+        assert mgr._is_window_id("@abc") is False

@@ -42,7 +42,7 @@ class MessageTask:
 
     task_type: Literal["content", "status_update", "status_clear"]
     text: str | None = None
-    window_name: str | None = None
+    window_id: str | None = None
     # content type fields
     parts: list[str] = field(default_factory=list)
     tool_use_id: str | None = None
@@ -59,7 +59,7 @@ _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 # for editing tool_use messages with results
 _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
-# Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_name, last_text)
+# Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
 
@@ -97,7 +97,7 @@ def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
 
 def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
-    if base.window_name != candidate.window_name:
+    if base.window_id != candidate.window_id:
         return False
     if candidate.task_type != "content":
         return False
@@ -165,7 +165,7 @@ async def _merge_content_tasks(
     return (
         MessageTask(
             task_type="content",
-            window_name=first.window_name,
+            window_id=first.window_id,
             parts=merged_parts,
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
@@ -230,7 +230,7 @@ def _send_kwargs(thread_id: int | None) -> dict[str, int]:
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Process a content message task."""
-    wname = task.window_name or ""
+    wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
 
@@ -251,7 +251,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     parse_mode="MarkdownV2",
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                await _check_and_send_status(bot, user_id, wname, task.thread_id)
+                await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
                 raise
@@ -265,7 +265,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         text=plain_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    await _check_and_send_status(bot, user_id, wname, task.thread_id)
+                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
                     raise
@@ -286,7 +286,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                 bot,
                 user_id,
                 tid,
-                wname,
+                wid,
                 part,
             )
             if converted_msg_id is not None:
@@ -308,14 +308,14 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
     # 4. After content, check and send status
-    await _check_and_send_status(bot, user_id, wname, task.thread_id)
+    await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 
 async def _convert_status_to_content(
     bot: Bot,
     user_id: int,
     thread_id_or_0: int,
-    window_name: str,
+    window_id: str,
     content_text: str,
 ) -> int | None:
     """Convert status message to content message by editing it.
@@ -330,8 +330,8 @@ async def _convert_status_to_content(
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
 
-    msg_id, stored_wname, _last_text = info
-    if stored_wname != window_name:
+    msg_id, stored_wid, _last_text = info
+    if stored_wid != window_id:
         # Different window, just delete the old status
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
@@ -373,7 +373,7 @@ async def _process_status_update_task(
     bot: Bot, user_id: int, task: MessageTask
 ) -> None:
     """Process a status update task."""
-    wname = task.window_name or ""
+    wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
     skey = (user_id, tid)
@@ -396,12 +396,12 @@ async def _process_status_update_task(
     current_info = _status_msg_info.get(skey)
 
     if current_info:
-        msg_id, stored_wname, last_text = current_info
+        msg_id, stored_wid, last_text = current_info
 
-        if stored_wname != wname:
+        if stored_wid != wid:
             # Window changed - delete old and send new
             await _do_clear_status_message(bot, user_id, tid)
-            await _do_send_status_message(bot, user_id, tid, wname, status_text)
+            await _do_send_status_message(bot, user_id, tid, wid, status_text)
         elif status_text == last_text:
             # Same content, skip edit
             pass
@@ -415,7 +415,7 @@ async def _process_status_update_task(
                     parse_mode="MarkdownV2",
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                _status_msg_info[skey] = (msg_id, wname, status_text)
+                _status_msg_info[skey] = (msg_id, wid, status_text)
             except RetryAfter:
                 raise
             except Exception:
@@ -426,23 +426,23 @@ async def _process_status_update_task(
                         text=status_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    _status_msg_info[skey] = (msg_id, wname, status_text)
+                    _status_msg_info[skey] = (msg_id, wid, status_text)
                 except RetryAfter:
                     raise
                 except Exception as e:
                     logger.debug(f"Failed to edit status message: {e}")
                     _status_msg_info.pop(skey, None)
-                    await _do_send_status_message(bot, user_id, tid, wname, status_text)
+                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
     else:
         # No existing status message, send new
-        await _do_send_status_message(bot, user_id, tid, wname, status_text)
+        await _do_send_status_message(bot, user_id, tid, wid, status_text)
 
 
 async def _do_send_status_message(
     bot: Bot,
     user_id: int,
     thread_id_or_0: int,
-    window_name: str,
+    window_id: str,
     text: str,
 ) -> None:
     """Send a new status message and track it (internal, called from worker)."""
@@ -456,7 +456,7 @@ async def _do_send_status_message(
         **_send_kwargs(thread_id),  # type: ignore[arg-type]
     )
     if sent:
-        _status_msg_info[skey] = (sent.message_id, window_name, text)
+        _status_msg_info[skey] = (sent.message_id, window_id, text)
 
 
 async def _do_clear_status_message(
@@ -480,7 +480,7 @@ async def _do_clear_status_message(
 async def _check_and_send_status(
     bot: Bot,
     user_id: int,
-    window_name: str,
+    window_id: str,
     thread_id: int | None = None,
 ) -> None:
     """Check terminal for status line and send status message if present."""
@@ -488,7 +488,7 @@ async def _check_and_send_status(
     queue = _message_queues.get(user_id)
     if queue and not queue.empty():
         return
-    w = await tmux_manager.find_window_by_name(window_name)
+    w = await tmux_manager.find_window_by_id(window_id)
     if not w:
         return
 
@@ -499,13 +499,13 @@ async def _check_and_send_status(
     tid = thread_id or 0
     status_line = parse_status_line(pane_text)
     if status_line:
-        await _do_send_status_message(bot, user_id, tid, window_name, status_line)
+        await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
 async def enqueue_content_message(
     bot: Bot,
     user_id: int,
-    window_name: str,
+    window_id: str,
     parts: list[str],
     tool_use_id: str | None = None,
     content_type: str = "text",
@@ -514,9 +514,9 @@ async def enqueue_content_message(
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
-        "Enqueue content: user=%d, window=%s, content_type=%s",
+        "Enqueue content: user=%d, window_id=%s, content_type=%s",
         user_id,
-        window_name,
+        window_id,
         content_type,
     )
     queue = get_or_create_queue(bot, user_id)
@@ -524,7 +524,7 @@ async def enqueue_content_message(
     task = MessageTask(
         task_type="content",
         text=text,
-        window_name=window_name,
+        window_id=window_id,
         parts=parts,
         tool_use_id=tool_use_id,
         content_type=content_type,
@@ -536,7 +536,7 @@ async def enqueue_content_message(
 async def enqueue_status_update(
     bot: Bot,
     user_id: int,
-    window_name: str,
+    window_id: str,
     status_text: str | None,
     thread_id: int | None = None,
 ) -> None:
@@ -547,7 +547,7 @@ async def enqueue_status_update(
         task = MessageTask(
             task_type="status_update",
             text=status_text,
-            window_name=window_name,
+            window_id=window_id,
             thread_id=thread_id,
         )
     else:

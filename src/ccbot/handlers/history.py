@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _build_history_keyboard(
-    window_name: str,
+    window_id: str,
     page_index: int,
     total_pages: int,
     start_byte: int = 0,
@@ -31,7 +31,7 @@ def _build_history_keyboard(
 ) -> InlineKeyboardMarkup | None:
     """Build inline keyboard for history pagination.
 
-    Callback format: hp:<page>:<window>:<start>:<end> or hn:<page>:<window>:<start>:<end>
+    Callback format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
     When start=0 and end=0, it means full history (no byte range filter).
     """
     if total_pages <= 1:
@@ -40,7 +40,7 @@ def _build_history_keyboard(
     buttons = []
     if page_index > 0:
         cb_data = (
-            f"{CB_HISTORY_PREV}{page_index - 1}:{window_name}:{start_byte}:{end_byte}"
+            f"{CB_HISTORY_PREV}{page_index - 1}:{window_id}:{start_byte}:{end_byte}"
         )
         buttons.append(
             InlineKeyboardButton(
@@ -55,7 +55,7 @@ def _build_history_keyboard(
 
     if page_index < total_pages - 1:
         cb_data = (
-            f"{CB_HISTORY_NEXT}{page_index + 1}:{window_name}:{start_byte}:{end_byte}"
+            f"{CB_HISTORY_NEXT}{page_index + 1}:{window_id}:{start_byte}:{end_byte}"
         )
         buttons.append(
             InlineKeyboardButton(
@@ -69,7 +69,7 @@ def _build_history_keyboard(
 
 async def send_history(
     target: Any,
-    window_name: str,
+    window_id: str,
     offset: int = -1,
     edit: bool = False,
     *,
@@ -83,7 +83,7 @@ async def send_history(
 
     Args:
         target: Message object (for reply) or CallbackQuery (for edit).
-        window_name: Tmux window name (resolved to session via sent messages).
+        window_id: Tmux window ID (resolved to session via window_states).
         offset: Page index (0-based). -1 means last page (for full history)
                 or first page (for unread range).
         edit: If True, edit existing message instead of sending new one.
@@ -93,11 +93,13 @@ async def send_history(
         bot: Bot instance for direct send mode (when edit=False and bot is provided).
         message_thread_id: Telegram topic thread_id for targeted send.
     """
+    display_name = session_manager.get_display_name(window_id)
     # Determine if this is unread mode (specific byte range)
     is_unread = start_byte > 0 or end_byte > 0
     logger.debug(
-        "send_history: window=%s, offset=%d, is_unread=%s, byte_range=%d-%d",
-        window_name,
+        "send_history: window_id=%s (%s), offset=%d, is_unread=%s, byte_range=%d-%d",
+        window_id,
+        display_name,
         offset,
         is_unread,
         start_byte,
@@ -105,16 +107,16 @@ async def send_history(
     )
 
     messages, total = await session_manager.get_recent_messages(
-        window_name,
+        window_id,
         start_byte=start_byte,
         end_byte=end_byte if end_byte > 0 else None,
     )
 
     if total == 0:
         if is_unread:
-            text = f"📬 [{window_name}] No unread messages."
+            text = f"📬 [{display_name}] No unread messages."
         else:
-            text = f"📋 [{window_name}] No messages yet."
+            text = f"📋 [{display_name}] No messages yet."
         keyboard = None
     else:
         _start = TranscriptParser.EXPANDABLE_QUOTE_START
@@ -130,9 +132,9 @@ async def send_history(
         total = len(messages)
         if total == 0:
             if is_unread:
-                text = f"📬 [{window_name}] No unread messages."
+                text = f"📬 [{display_name}] No unread messages."
             else:
-                text = f"📋 [{window_name}] No messages yet."
+                text = f"📋 [{display_name}] No messages yet."
             keyboard = None
             if edit:
                 await safe_edit(target, text, reply_markup=keyboard)
@@ -148,15 +150,13 @@ async def send_history(
                 await safe_reply(target, text, reply_markup=keyboard)
             # Update offset even if no assistant messages
             if user_id is not None and end_byte > 0:
-                session_manager.update_user_window_offset(
-                    user_id, window_name, end_byte
-                )
+                session_manager.update_user_window_offset(user_id, window_id, end_byte)
             return
 
         if is_unread:
-            header = f"📬 [{window_name}] {total} unread messages"
+            header = f"📬 [{display_name}] {total} unread messages"
         else:
-            header = f"📋 [{window_name}] Messages ({total} total)"
+            header = f"📋 [{display_name}] Messages ({total} total)"
 
         lines = [header]
         for msg in messages:
@@ -204,7 +204,7 @@ async def send_history(
         page_index = max(0, min(offset, len(pages) - 1))
         text = pages[page_index]
         keyboard = _build_history_keyboard(
-            window_name, page_index, len(pages), start_byte, end_byte
+            window_id, page_index, len(pages), start_byte, end_byte
         )
         logger.debug(
             "send_history result: %d messages, %d pages, serving page %d",
@@ -229,4 +229,4 @@ async def send_history(
 
     # Update user's read offset after viewing unread
     if is_unread and user_id is not None and end_byte > 0:
-        session_manager.update_user_window_offset(user_id, window_name, end_byte)
+        session_manager.update_user_window_offset(user_id, window_id, end_byte)

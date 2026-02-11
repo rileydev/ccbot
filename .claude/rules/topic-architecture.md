@@ -6,31 +6,34 @@ The bot operates exclusively in Telegram Forum (topics) mode. There is **no** `a
 
 ```
 ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│  Topic ID   │ ───▶ │ Window Name │ ───▶ │ Session ID  │
-│  (Telegram) │      │   (tmux)    │      │  (Claude)   │
+│  Topic ID   │ ───▶ │ Window ID   │ ───▶ │ Session ID  │
+│  (Telegram) │      │ (tmux @id)  │      │  (Claude)   │
 └─────────────┘      └─────────────┘      └─────────────┘
      thread_bindings      session_map.json
      (state.json)         (written by hook)
 ```
 
-## Mapping 1: Topic → Window (thread_bindings)
+Window IDs (e.g. `@0`, `@12`) are guaranteed unique within a tmux server session. Window names are stored separately as display names (`window_display_names` map).
+
+## Mapping 1: Topic → Window ID (thread_bindings)
 
 ```python
 # session.py: SessionManager
-thread_bindings: dict[int, dict[int, str]]  # user_id → {thread_id → window_name}
+thread_bindings: dict[int, dict[int, str]]  # user_id → {thread_id → window_id}
+window_display_names: dict[str, str]        # window_id → window_name (for display)
 ```
 
 - Storage: memory + `state.json`
 - Written when: user creates a new session via the directory browser in a topic
 - Purpose: route user messages to the correct tmux window
 
-## Mapping 2: Window → Session (session_map.json)
+## Mapping 2: Window ID → Session (session_map.json)
 
 ```python
-# session_map.json (key format: "tmux_session:window_name")
+# session_map.json (key format: "tmux_session:window_id")
 {
-  "ccbot:project": {"session_id": "uuid-xxx", "cwd": "/path/to/project"},
-  "ccbot:project-2": {"session_id": "uuid-yyy", "cwd": "/path/to/project"}
+  "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
+  "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
 }
 ```
 
@@ -44,14 +47,14 @@ thread_bindings: dict[int, dict[int, str]]  # user_id → {thread_id → window_
 **Outbound** (user → Claude):
 ```
 User sends "hello" in topic (thread_id=42)
-  → thread_bindings[user_id][42] → "project"
-  → send_to_window("project", "hello")
+  → thread_bindings[user_id][42] → "@0"
+  → send_to_window("@0", "hello")   # resolves via find_window_by_id
 ```
 
 **Inbound** (Claude → user):
 ```
 SessionMonitor reads new message (session_id = "uuid-xxx")
-  → Iterate thread_bindings, find (user, thread) whose window maps to this session
+  → Iterate thread_bindings, find (user, thread) whose window_id maps to this session
   → Deliver message to user in the correct topic (thread_id)
 ```
 

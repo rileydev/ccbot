@@ -91,31 +91,11 @@ class TmuxManager:
             if not session:
                 return windows
 
-            seen_names: set[str] = set()
             for window in session.windows:
                 name = window.window_name or ""
                 # Skip the main window (placeholder window)
                 if name == config.tmux_main_window_name:
                     continue
-
-                # Auto-rename duplicate window names (same suffix as create_window)
-                if name in seen_names:
-                    base_name = name
-                    counter = 2
-                    while f"{base_name}-{counter}" in seen_names:
-                        counter += 1
-                    new_name = f"{base_name}-{counter}"
-                    try:
-                        window.rename_window(new_name)
-                        logger.info(
-                            "Renamed duplicate window '%s' → '%s'", name, new_name
-                        )
-                        name = new_name
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to rename duplicate window '%s': %s", name, e
-                        )
-                seen_names.add(name)
 
                 try:
                     # Get the active pane's current path and command
@@ -155,7 +135,23 @@ class TmuxManager:
         for window in windows:
             if window.window_name == window_name:
                 return window
-        logger.debug("Window not found: %s", window_name)
+        logger.debug("Window not found by name: %s", window_name)
+        return None
+
+    async def find_window_by_id(self, window_id: str) -> TmuxWindow | None:
+        """Find a window by its tmux window ID (e.g. '@0', '@12').
+
+        Args:
+            window_id: The tmux window ID to match
+
+        Returns:
+            TmuxWindow if found, None otherwise
+        """
+        windows = await self.list_windows()
+        for window in windows:
+            if window.window_id == window_id:
+                return window
+        logger.debug("Window not found by id: %s", window_id)
         return None
 
     async def capture_pane(self, window_id: str, with_ansi: bool = False) -> str | None:
@@ -327,7 +323,7 @@ class TmuxManager:
         work_dir: str,
         window_name: str | None = None,
         start_claude: bool = True,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
         Args:
@@ -336,14 +332,14 @@ class TmuxManager:
             start_claude: Whether to start claude command
 
         Returns:
-            Tuple of (success, message, window_name)
+            Tuple of (success, message, window_name, window_id)
         """
         # Validate directory first
         path = Path(work_dir).expanduser().resolve()
         if not path.exists():
-            return False, f"Directory does not exist: {work_dir}", ""
+            return False, f"Directory does not exist: {work_dir}", "", ""
         if not path.is_dir():
-            return False, f"Not a directory: {work_dir}", ""
+            return False, f"Not a directory: {work_dir}", "", ""
 
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name
@@ -356,7 +352,7 @@ class TmuxManager:
             counter += 1
 
         # Create window in thread
-        def _create_and_start() -> tuple[bool, str, str]:
+        def _create_and_start() -> tuple[bool, str, str, str]:
             session = self.get_or_create_session()
             try:
                 # Create new window
@@ -365,22 +361,30 @@ class TmuxManager:
                     start_directory=str(path),
                 )
 
+                wid = window.window_id or ""
+
                 # Start Claude Code if requested
                 if start_claude:
                     pane = window.active_pane
                     if pane:
                         pane.send_keys(config.claude_command, enter=True)
 
-                logger.info("Created window '%s' at %s", final_window_name, path)
+                logger.info(
+                    "Created window '%s' (id=%s) at %s",
+                    final_window_name,
+                    wid,
+                    path,
+                )
                 return (
                     True,
                     f"Created window '{final_window_name}' at {path}",
                     final_window_name,
+                    wid,
                 )
 
             except Exception as e:
                 logger.error(f"Failed to create window: {e}")
-                return False, f"Failed to create window: {e}", ""
+                return False, f"Failed to create window: {e}", "", ""
 
         return await asyncio.to_thread(_create_and_start)
 

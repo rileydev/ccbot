@@ -58,23 +58,23 @@ def clear_window_picker_state(user_data: dict | None) -> None:
 
 
 def build_window_picker(
-    windows: list[tuple[str, str]],
+    windows: list[tuple[str, str, str]],
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build window picker UI for unbound tmux windows.
 
     Args:
-        windows: List of (window_name, cwd) tuples.
+        windows: List of (window_id, window_name, cwd) tuples.
 
-    Returns: (text, keyboard, window_names) where window_names is the ordered list for caching.
+    Returns: (text, keyboard, window_ids) where window_ids is the ordered list for caching.
     """
-    window_names = [name for name, _ in windows]
+    window_ids = [wid for wid, _, _ in windows]
 
     lines = [
         "*Bind to Existing Window*\n",
         "These windows are running but not bound to any topic.",
         "Pick one to attach it here, or start a new session.\n",
     ]
-    for i, (name, cwd) in enumerate(windows):
+    for _wid, name, cwd in windows:
         display_cwd = cwd.replace(str(Path.home()), "~")
         lines.append(f"• `{name}` — {display_cwd}")
 
@@ -82,7 +82,7 @@ def build_window_picker(
     for i in range(0, len(windows), 2):
         row = []
         for j in range(min(2, len(windows) - i)):
-            name = windows[i + j][0]
+            name = windows[i + j][1]
             display = name[:12] + "…" if len(name) > 13 else name
             row.append(
                 InlineKeyboardButton(
@@ -99,7 +99,7 @@ def build_window_picker(
     )
 
     text = "\n".join(lines)
-    return text, InlineKeyboardMarkup(buttons), window_names
+    return text, InlineKeyboardMarkup(buttons), window_ids
 
 
 def build_directory_browser(

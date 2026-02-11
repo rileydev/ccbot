@@ -42,28 +42,28 @@ INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
 # Track interactive UI message IDs: (user_id, thread_id_or_0) -> message_id
 _interactive_msgs: dict[tuple[int, int], int] = {}
 
-# Track interactive mode: (user_id, thread_id_or_0) -> window_name
+# Track interactive mode: (user_id, thread_id_or_0) -> window_id
 _interactive_mode: dict[tuple[int, int], str] = {}
 
 
 def get_interactive_window(user_id: int, thread_id: int | None = None) -> str | None:
-    """Get the window name for user's interactive mode."""
+    """Get the window_id for user's interactive mode."""
     return _interactive_mode.get((user_id, thread_id or 0))
 
 
 def set_interactive_mode(
     user_id: int,
-    window_name: str,
+    window_id: str,
     thread_id: int | None = None,
 ) -> None:
     """Set interactive mode for a user."""
     logger.debug(
-        "Set interactive mode: user=%d, window=%s, thread=%s",
+        "Set interactive mode: user=%d, window_id=%s, thread=%s",
         user_id,
-        window_name,
+        window_id,
         thread_id,
     )
-    _interactive_mode[(user_id, thread_id or 0)] = window_name
+    _interactive_mode[(user_id, thread_id or 0)] = window_id
 
 
 def clear_interactive_mode(user_id: int, thread_id: int | None = None) -> None:
@@ -78,7 +78,7 @@ def get_interactive_msg_id(user_id: int, thread_id: int | None = None) -> int | 
 
 
 def _build_interactive_keyboard(
-    window_name: str,
+    window_id: str,
     ui_name: str = "",
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
@@ -93,11 +93,11 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "␣ Space", callback_data=f"{CB_ASK_SPACE}{window_name}"[:64]
+                "␣ Space", callback_data=f"{CB_ASK_SPACE}{window_id}"[:64]
             ),
-            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_name}"[:64]),
+            InlineKeyboardButton("↑", callback_data=f"{CB_ASK_UP}{window_id}"[:64]),
             InlineKeyboardButton(
-                "⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_name}"[:64]
+                "⇥ Tab", callback_data=f"{CB_ASK_TAB}{window_id}"[:64]
             ),
         ]
     )
@@ -105,7 +105,7 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_name}"[:64]
+                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
                 ),
             ]
         )
@@ -113,13 +113,13 @@ def _build_interactive_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    "←", callback_data=f"{CB_ASK_LEFT}{window_name}"[:64]
+                    "←", callback_data=f"{CB_ASK_LEFT}{window_id}"[:64]
                 ),
                 InlineKeyboardButton(
-                    "↓", callback_data=f"{CB_ASK_DOWN}{window_name}"[:64]
+                    "↓", callback_data=f"{CB_ASK_DOWN}{window_id}"[:64]
                 ),
                 InlineKeyboardButton(
-                    "→", callback_data=f"{CB_ASK_RIGHT}{window_name}"[:64]
+                    "→", callback_data=f"{CB_ASK_RIGHT}{window_id}"[:64]
                 ),
             ]
         )
@@ -127,13 +127,13 @@ def _build_interactive_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_name}"[:64]
+                "⎋ Esc", callback_data=f"{CB_ASK_ESC}{window_id}"[:64]
             ),
             InlineKeyboardButton(
-                "🔄", callback_data=f"{CB_ASK_REFRESH}{window_name}"[:64]
+                "🔄", callback_data=f"{CB_ASK_REFRESH}{window_id}"[:64]
             ),
             InlineKeyboardButton(
-                "⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_name}"[:64]
+                "⏎ Enter", callback_data=f"{CB_ASK_ENTER}{window_id}"[:64]
             ),
         ]
     )
@@ -143,7 +143,7 @@ def _build_interactive_keyboard(
 async def handle_interactive_ui(
     bot: Bot,
     user_id: int,
-    window_name: str,
+    window_id: str,
     thread_id: int | None = None,
 ) -> bool:
     """Capture terminal and send interactive UI content to user.
@@ -154,21 +154,21 @@ async def handle_interactive_ui(
     """
     ikey = (user_id, thread_id or 0)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    w = await tmux_manager.find_window_by_name(window_name)
+    w = await tmux_manager.find_window_by_id(window_id)
     if not w:
         return False
 
     # Capture plain text (no ANSI colors)
     pane_text = await tmux_manager.capture_pane(w.window_id)
     if not pane_text:
-        logger.debug("No pane text captured for window %s", window_name)
+        logger.debug("No pane text captured for window_id %s", window_id)
         return False
 
     # Quick check if it looks like an interactive UI
     if not is_interactive_ui(pane_text):
         logger.debug(
-            "No interactive UI detected in window %s (last 3 lines: %s)",
-            window_name,
+            "No interactive UI detected in window_id %s (last 3 lines: %s)",
+            window_id,
             pane_text.strip().split("\n")[-3:],
         )
         return False
@@ -179,7 +179,7 @@ async def handle_interactive_ui(
         return False
 
     # Build message with navigation keyboard
-    keyboard = _build_interactive_keyboard(window_name, ui_name=content.name)
+    keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)
 
     # Send as plain text (no markdown conversion)
     text = content.content
@@ -200,14 +200,16 @@ async def handle_interactive_ui(
                 reply_markup=keyboard,
                 link_preview_options=NO_LINK_PREVIEW,
             )
-            _interactive_mode[ikey] = window_name
+            _interactive_mode[ikey] = window_id
             return True
         except Exception:
             # Message unchanged or other error - silently ignore, don't send new
             return True
 
     # Send new message
-    logger.info("Sending interactive UI to user %d for window %s", user_id, window_name)
+    logger.info(
+        "Sending interactive UI to user %d for window_id %s", user_id, window_id
+    )
     sent = await rate_limit_send_message(
         bot,
         chat_id,
@@ -217,7 +219,7 @@ async def handle_interactive_ui(
     )
     if sent:
         _interactive_msgs[ikey] = sent.message_id
-        _interactive_mode[ikey] = window_name
+        _interactive_mode[ikey] = window_id
         return True
     return False
 

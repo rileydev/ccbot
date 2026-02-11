@@ -16,7 +16,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 
 ## Core Design Constraints
 
-- **1 Topic = 1 Window = 1 Session** — all logic is window-centric (not directory-centric). Same directory can have multiple windows (auto-suffixed: `project-2`).
+- **1 Topic = 1 Window = 1 Session** — all internal routing keyed by tmux window ID (`@0`, `@12`), not window name. Window names kept as display names. Same directory can have multiple windows.
 - **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.

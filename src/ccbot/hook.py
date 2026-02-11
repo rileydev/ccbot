@@ -200,18 +200,31 @@ def hook_main() -> None:
             "-t",
             pane_id,
             "-p",
-            "#{session_name}:#{window_name}",
+            "#{session_name}:#{window_id}:#{window_name}",
         ],
         capture_output=True,
         text=True,
     )
-    session_window_key = result.stdout.strip()
-    if not session_window_key or ":" not in session_window_key:
-        logger.warning("Failed to get session:window key from tmux (pane=%s)", pane_id)
+    raw_output = result.stdout.strip()
+    # Expected format: "session_name:@id:window_name"
+    parts = raw_output.split(":", 2)
+    if len(parts) < 3:
+        logger.warning(
+            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
+            pane_id,
+            raw_output,
+        )
         return
+    tmux_session_name, window_id, window_name = parts
+    # Key uses window_id for uniqueness
+    session_window_key = f"{tmux_session_name}:{window_id}"
 
     logger.debug(
-        "tmux key=%s, session_id=%s, cwd=%s", session_window_key, session_id, cwd
+        "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
+        session_window_key,
+        window_name,
+        session_id,
+        cwd,
     )
 
     # Read-modify-write with file locking to prevent concurrent hook races
@@ -238,7 +251,15 @@ def hook_main() -> None:
                 session_map[session_window_key] = {
                     "session_id": session_id,
                     "cwd": cwd,
+                    "window_name": window_name,
                 }
+
+                # Clean up old-format key ("session:window_name") if it exists.
+                # Previous versions keyed by window_name instead of window_id.
+                old_key = f"{tmux_session_name}:{window_name}"
+                if old_key != session_window_key and old_key in session_map:
+                    del session_map[old_key]
+                    logger.info("Removed old-format session_map key: %s", old_key)
 
                 from .utils import atomic_write_json
 

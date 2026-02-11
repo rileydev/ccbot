@@ -79,7 +79,8 @@ class SessionMonitor:
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
-        self._last_session_map: dict[str, str] = {}  # window_name -> session_id
+        # Keys may be window_id (@12) or window_name (old format) during transition
+        self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
 
@@ -347,9 +348,12 @@ class SessionMonitor:
         return new_messages
 
     async def _load_current_session_map(self) -> dict[str, str]:
-        """Load current session_map and return window_name -> session_id mapping.
+        """Load current session_map and return window_key -> session_id mapping.
 
-        Keys in session_map are formatted as "tmux_session:window_name".
+        Keys in session_map are formatted as "tmux_session:window_id"
+        (e.g. "ccbot:@12"). Old-format keys ("ccbot:window_name") are also
+        accepted so that sessions running before a code upgrade continue
+        to be monitored until the hook re-fires with new format.
         Only entries matching our tmux_session_name are processed.
         """
         window_to_session: dict[str, str] = {}
@@ -363,10 +367,10 @@ class SessionMonitor:
                     # Only process entries for our tmux session
                     if not key.startswith(prefix):
                         continue
-                    window_name = key[len(prefix) :]
+                    window_key = key[len(prefix) :]
                     session_id = info.get("session_id", "")
                     if session_id:
-                        window_to_session[window_name] = session_id
+                        window_to_session[window_key] = session_id
             except (json.JSONDecodeError, OSError):
                 pass
         return window_to_session
@@ -400,11 +404,14 @@ class SessionMonitor:
         sessions_to_remove: set[str] = set()
 
         # Check for window session changes (window exists in both, but session_id changed)
-        for window_name, old_session_id in self._last_session_map.items():
-            new_session_id = current_map.get(window_name)
+        for window_id, old_session_id in self._last_session_map.items():
+            new_session_id = current_map.get(window_id)
             if new_session_id and new_session_id != old_session_id:
                 logger.info(
-                    f"Window '{window_name}' session changed: {old_session_id} -> {new_session_id}"
+                    "Window '%s' session changed: %s -> %s",
+                    window_id,
+                    old_session_id,
+                    new_session_id,
                 )
                 sessions_to_remove.add(old_session_id)
 
@@ -413,10 +420,12 @@ class SessionMonitor:
         current_windows = set(current_map.keys())
         deleted_windows = old_windows - current_windows
 
-        for window_name in deleted_windows:
-            old_session_id = self._last_session_map[window_name]
+        for window_id in deleted_windows:
+            old_session_id = self._last_session_map[window_id]
             logger.info(
-                f"Window '{window_name}' deleted, removing session {old_session_id}"
+                "Window '%s' deleted, removing session %s",
+                window_id,
+                old_session_id,
             )
             sessions_to_remove.add(old_session_id)
 

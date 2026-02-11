@@ -83,18 +83,19 @@ Handler modules (handlers/):
   callback_data.py    ─ Callback data constants
 
 State files (~/.ccbot/ or $CCBOT_DIR/):
-  state.json         ─ thread bindings + window states + read offsets
-  session_map.json   ─ hook-generated window→session mapping
+  state.json         ─ thread bindings + window states + display names + read offsets
+  session_map.json   ─ hook-generated window_id→session mapping
   monitor_state.json ─ poll progress (byte offset) per JSONL file
 ```
 
 ## Key Design Decisions
 
 - **Topic-centric** — Each Telegram topic binds to one tmux window. No centralized session list; topics *are* the session list.
-- **Window-centric** — All state anchored to tmux window names (e.g. `myproject`), not directories. Same directory can have multiple windows (auto-suffixed: `myproject-2`).
+- **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
 - **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
 - **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
 - **MarkdownV2 with fallback** — All messages go through `safe_reply`/`safe_edit`/`safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
 - Only sessions registered in `session_map.json` (via hook) are monitored.
-- Notifications delivered to users via thread bindings (topic → window → session).
+- Notifications delivered to users via thread bindings (topic → window_id → session).
+- **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.
