@@ -15,6 +15,7 @@ parse_status_line(), strip_pane_chrome(), extract_bash_output().
 
 import re
 from dataclasses import dataclass
+from typing import NamedTuple
 
 
 @dataclass
@@ -191,6 +192,46 @@ def parse_status_line(pane_text: str) -> str | None:
             continue
         if line[0] in STATUS_SPINNERS:
             return line[1:].strip()
+    return None
+
+
+# ── Context info parsing ───────────────────────────────────────────────
+
+# Two known formats for context display in Claude Code:
+#   1. "[Opus 4.6] Context: 34%"  (older versions / some configs)
+#   2. "49% context left"          (current Claude Code ~2026)
+_RE_CONTEXT_BRACKET = re.compile(
+    r"\[(?P<model>[^\]]+)\]\s*Context:\s*(?P<pct>\d+)%"
+)
+_RE_CONTEXT_LEFT = re.compile(r"(?P<pct>\d+)%\s*context\s+left")
+
+
+class ContextInfo(NamedTuple):
+    """Context window usage parsed from the Claude Code chrome."""
+
+    context_percent: int  # 0-100
+
+
+def parse_context_info(pane_text: str) -> ContextInfo | None:
+    """Extract context usage from the Claude Code status area.
+
+    Recognises two formats that appear in the bottom 10 lines of the pane::
+
+        [Opus 4.6] Context: 34%      ← older / some configs
+        49% context left              ← current Claude Code (2026)
+
+    Returns *None* if neither pattern is found.
+    """
+    if not pane_text:
+        return None
+
+    for line in reversed(pane_text.strip().split("\n")[-10:]):
+        m = _RE_CONTEXT_BRACKET.search(line)
+        if m:
+            return ContextInfo(context_percent=int(m.group("pct")))
+        m = _RE_CONTEXT_LEFT.search(line)
+        if m:
+            return ContextInfo(context_percent=int(m.group("pct")))
     return None
 
 

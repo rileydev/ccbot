@@ -24,7 +24,7 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import is_interactive_ui, parse_context_info, parse_status_line
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -41,6 +41,10 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
+
+# Cache last-known context % per window (the "NN% context left" line is only
+# visible when Claude is idle, not while it's actively working)
+_context_cache: dict[str, int] = {}  # window_id -> last known context %
 
 
 async def update_status_message(
@@ -90,7 +94,18 @@ async def update_status_message(
     # Normal status line check
     status_line = parse_status_line(pane_text)
 
+    # Update context cache — the "NN% context left" line is only visible
+    # when Claude is idle, so we cache it for use during active work
+    ctx = parse_context_info(pane_text)
+    if ctx:
+        _context_cache[window_id] = ctx.context_percent
+
     if status_line:
+        # Prepend cached context usage if available
+        cached_pct = _context_cache.get(window_id)
+        if cached_pct is not None:
+            status_line = f"[{cached_pct}%] {status_line}"
+
         await enqueue_status_update(
             bot,
             user_id,

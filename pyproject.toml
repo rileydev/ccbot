@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 ccbot = "ccbot.main:main"
+ccbot-sync = "ccbot.sync_skills:main"
 
 [project.optional-dependencies]
 dev = [

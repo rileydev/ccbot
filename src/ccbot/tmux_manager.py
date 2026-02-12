@@ -329,6 +329,59 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_kill)
 
+    async def get_pane_pid(self, window_id: str) -> int | None:
+        """Get the PID of the foreground process running in a window's pane.
+
+        Uses ``tmux display-message`` to read ``pane_pid`` (the shell PID),
+        then finds the deepest child — typically the ``claude`` process.
+        Returns *None* if the window doesn't exist or PID can't be determined.
+        """
+
+        def _sync_get_pid() -> int | None:
+            import subprocess
+
+            try:
+                # Get pane_pid (the shell process) via tmux
+                result = subprocess.run(
+                    [
+                        "tmux",
+                        "display-message",
+                        "-t",
+                        window_id,
+                        "-p",
+                        "#{pane_pid}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    return None
+
+                shell_pid = int(result.stdout.strip())
+
+                # Walk child processes to find the deepest one (claude)
+                pid = shell_pid
+                while True:
+                    children = subprocess.run(
+                        ["pgrep", "-P", str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    child_pids = children.stdout.strip().split()
+                    if not child_pids:
+                        break
+                    # Take the first child (the main process, not background jobs)
+                    pid = int(child_pids[0])
+
+                return pid
+            except Exception as e:
+                logger.error("Failed to get pane PID for %s: %s", window_id, e)
+                return None
+
+        return await asyncio.to_thread(_sync_get_pid)
+
     async def create_window(
         self,
         work_dir: str,
