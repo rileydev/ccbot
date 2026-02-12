@@ -356,6 +356,52 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send SIGHUP to Claude Code to reload MCP servers, hooks, and settings.
+
+    Requires the claude-wrapper.sh script as CLAUDE_COMMAND so the process
+    restarts with --resume (preserving conversation context).
+    """
+    import signal
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    pid = await tmux_manager.get_pane_pid(wid)
+    if not pid:
+        await safe_reply(update.message, "❌ Could not find Claude process PID.")
+        return
+
+    import os
+
+    try:
+        os.kill(pid, signal.SIGHUP)
+        await safe_reply(
+            update.message,
+            "🔄 Reloading Claude Code — MCP servers, hooks, and settings "
+            "will be refreshed. Session will resume automatically.",
+        )
+    except ProcessLookupError:
+        await safe_reply(update.message, "❌ Claude process not found (PID gone).")
+    except PermissionError:
+        await safe_reply(update.message, "❌ Permission denied sending signal.")
+
+
 # --- Screenshot keyboard with quick control keys ---
 
 # key_id → (tmux_key, enter, literal)
@@ -1470,6 +1516,7 @@ async def post_init(application: Application) -> None:
         BotCommand("resume", "Resume a previous conversation"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("reload", "Reload MCP servers, hooks, and settings"),
         BotCommand("kill", "Kill session and delete topic"),
     ]
     # Add Claude Code slash commands
@@ -1534,6 +1581,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("reload", reload_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(
