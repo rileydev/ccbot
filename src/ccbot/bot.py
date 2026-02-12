@@ -146,6 +146,52 @@ CC_COMMANDS: dict[str, str] = {
     "memory": "↗ Edit CLAUDE.md",
 }
 
+# Skill commands: Telegram-safe name → (Claude Code slash command, description)
+# Telegram only allows [a-z0-9_] in command names, so colons/hyphens are mapped.
+SKILL_COMMANDS: dict[str, tuple[str, str]] = {
+    # GSD workflow
+    "gsd_progress": ("/gsd:progress", "↗ Check project progress"),
+    "gsd_execute_phase": ("/gsd:execute-phase", "↗ Execute current phase"),
+    "gsd_plan_phase": ("/gsd:plan-phase", "↗ Plan a phase"),
+    "gsd_quick": ("/gsd:quick", "↗ Quick task with GSD guarantees"),
+    "gsd_debug": ("/gsd:debug", "↗ Systematic debugging"),
+    "gsd_help": ("/gsd:help", "↗ Show GSD commands"),
+    "gsd_resume_work": ("/gsd:resume-work", "↗ Resume previous work session"),
+    "gsd_pause_work": ("/gsd:pause-work", "↗ Pause work with context handoff"),
+    "gsd_verify_work": ("/gsd:verify-work", "↗ Validate built features via UAT"),
+    "gsd_settings": ("/gsd:settings", "↗ Configure GSD workflow"),
+    "gsd_map_codebase": ("/gsd:map-codebase", "↗ Analyze codebase structure"),
+    "gsd_new_project": ("/gsd:new-project", "↗ Initialize new project"),
+    "gsd_new_milestone": ("/gsd:new-milestone", "↗ Start new milestone"),
+    "gsd_add_phase": ("/gsd:add-phase", "↗ Add phase to roadmap"),
+    "gsd_add_todo": ("/gsd:add-todo", "↗ Capture idea as todo"),
+    "gsd_check_todos": ("/gsd:check-todos", "↗ List and pick a todo"),
+    "gsd_discuss_phase": ("/gsd:discuss-phase", "↗ Discuss phase before planning"),
+    "gsd_research_phase": ("/gsd:research-phase", "↗ Research phase implementation"),
+    # Beads issue tracking
+    "bd_list": ("/beads:list", "↗ List issues with filters"),
+    "bd_ready": ("/beads:ready", "↗ Find ready-to-work tasks"),
+    "bd_show": ("/beads:show", "↗ Show issue details"),
+    "bd_create": ("/beads:create", "↗ Create a new issue"),
+    "bd_update": ("/beads:update", "↗ Update issue status"),
+    "bd_close": ("/beads:close", "↗ Close completed issue"),
+    "bd_stats": ("/beads:stats", "↗ Project statistics"),
+    "bd_sync": ("/beads:sync", "↗ Sync issues with git"),
+    "bd_blocked": ("/beads:blocked", "↗ Show blocked issues"),
+    "bd_search": ("/beads:search", "↗ Search issues by text"),
+    # Code review & workflow
+    "review_pr": ("/review-pr", "↗ Review a pull request"),
+    "commit": ("/commit", "↗ Commit staged changes"),
+    "write_plan": ("/write-plan", "↗ Create implementation plan"),
+    "execute_plan": ("/execute-plan", "↗ Execute implementation plan"),
+    "brainstorm": ("/brainstorm", "↗ Explore requirements before building"),
+}
+
+# Reverse lookup: Telegram command name → Claude Code slash command
+_SKILL_TRANSLATE: dict[str, str] = {
+    name: cc_cmd for name, (cc_cmd, _) in SKILL_COMMANDS.items()
+}
+
 
 def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
@@ -374,6 +420,16 @@ async def forward_command_handler(
     cmd_text = update.message.text or ""
     # The full text is already a slash command like "/clear" or "/compact foo"
     cc_slash = cmd_text.split("@")[0]  # strip bot mention
+
+    # Translate Telegram-safe skill names to Claude Code format
+    # e.g. "/gsd_progress" → "/gsd:progress", "/review_pr args" → "/review-pr args"
+    parts = cc_slash.split(None, 1)  # split command from args
+    cmd_name = parts[0].lstrip("/")
+    cmd_args = parts[1] if len(parts) > 1 else ""
+    if cmd_name in _SKILL_TRANSLATE:
+        cc_slash = _SKILL_TRANSLATE[cmd_name]
+        if cmd_args:
+            cc_slash += " " + cmd_args
     wid = session_manager.resolve_window_for_thread(user.id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -1370,6 +1426,9 @@ async def post_init(application: Application) -> None:
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
+        bot_commands.append(BotCommand(cmd_name, desc))
+    # Add skill commands (Telegram-safe names with translations)
+    for cmd_name, (_, desc) in SKILL_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
 
     await application.bot.set_my_commands(bot_commands)
