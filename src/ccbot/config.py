@@ -5,9 +5,13 @@ monitoring intervals from environment variables (with .env support).
 .env loading priority: local .env (cwd) > $CCBOT_DIR/.env (default ~/.ccbot).
 The module-level `config` instance is imported by nearly every other module.
 
+Notification preferences are loaded from $CCBOT_DIR/notify.json.
+If the file doesn't exist, it is created with defaults (everything on).
+
 Key class: Config (singleton instantiated as `config`).
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -17,6 +21,69 @@ from dotenv import load_dotenv
 from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
+
+# Default notification settings — all on for backward compatibility.
+# Each key maps to a content_type from the transcript parser.
+NOTIFY_DEFAULTS: dict[str, bool] = {
+    "text": True,  # Claude's text responses (conversation output)
+    "thinking": True,  # Internal reasoning / thinking blocks
+    "tool_use": True,  # Tool call summaries (e.g. "Read(file.py)")
+    "tool_result": True,  # Tool output (e.g. "Read 50 lines")
+    "tool_error": True,  # Errors from tool execution
+    "local_command": True,  # Slash command results (e.g. /commit)
+    "user": True,  # User messages echoed back (👤 prefix)
+}
+
+
+class NotifyConfig:
+    """Per-content-type notification toggle loaded from notify.json."""
+
+    def __init__(self, config_dir: Path) -> None:
+        self._file = config_dir / "notify.json"
+        self._settings: dict[str, bool] = dict(NOTIFY_DEFAULTS)
+        self._load()
+
+    def _load(self) -> None:
+        if self._file.exists():
+            try:
+                with open(self._file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for key in NOTIFY_DEFAULTS:
+                        if key in data and isinstance(data[key], bool):
+                            self._settings[key] = data[key]
+                logger.debug("Loaded notify config from %s", self._file)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Failed to read notify.json: %s (using defaults)", e)
+        else:
+            # Create the file with defaults so the user can edit it
+            self._save()
+            logger.info("Created default notify.json at %s", self._file)
+
+    def _save(self) -> None:
+        try:
+            with open(self._file, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            logger.error("Failed to write notify.json: %s", e)
+
+    def should_notify(self, content_type: str, *, is_error: bool = False) -> bool:
+        """Check whether a message with this content_type should be sent.
+
+        Tool errors are controlled by the separate 'tool_error' toggle,
+        so an error in a tool_result can still be shown even if
+        'tool_result' is off.
+        """
+        if is_error:
+            return self._settings.get("tool_error", True)
+        return self._settings.get(content_type, True)
+
+    def summary(self) -> str:
+        """One-line summary for logging."""
+        on = [k for k, v in self._settings.items() if v]
+        off = [k for k, v in self._settings.items() if not v]
+        return f"on={on}, off={off}"
 
 
 class Config:
@@ -74,23 +141,17 @@ class Config:
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = True
 
-        # Notification mode: "all" (default) forwards everything,
-        # "quiet" only forwards text responses, errors, and interactive prompts
-        self.notify_mode = os.getenv("NOTIFY_MODE", "all").lower()
-        if self.notify_mode not in ("all", "quiet"):
-            logger.warning(
-                "Unknown NOTIFY_MODE '%s', falling back to 'all'", self.notify_mode
-            )
-            self.notify_mode = "all"
+        # Per-content-type notification filtering
+        self.notify = NotifyConfig(self.config_dir)
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s, notify_mode=%s",
+            "tmux_session=%s, notify=[%s]",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
             self.tmux_session_name,
-            self.notify_mode,
+            self.notify.summary(),
         )
 
     def is_user_allowed(self, user_id: int) -> bool:

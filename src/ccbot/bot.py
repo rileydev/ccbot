@@ -1266,25 +1266,18 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         f"text_len={len(msg.text)}"
     )
 
-    # Quiet mode filtering — skip noisy intermediate messages.
+    # Notification filtering via ~/.ccbot/notify.json.
     # Interactive prompts (AskUserQuestion, permissions) are handled
-    # separately in the per-user loop below, before this filter applies.
-    if config.notify_mode == "quiet":
-        if msg.content_type == "thinking":
-            logger.debug("Quiet mode: skipping thinking message")
-            return
-        if msg.content_type == "tool_use":
-            # Still allow interactive tools through (handled below)
-            if msg.tool_name not in INTERACTIVE_TOOL_NAMES:
-                logger.debug("Quiet mode: skipping tool_use (%s)", msg.tool_name)
-                return
-        if msg.content_type == "tool_result":
-            # Keep errors and interruptions, skip normal results
-            if "Error:" not in msg.text and "\u23f9 Interrupted" not in msg.text:
-                logger.debug("Quiet mode: skipping tool_result")
-                return
-        if msg.content_type == "local_command":
-            logger.debug("Quiet mode: skipping local_command")
+    # separately in the per-user loop below and always go through.
+    if msg.content_type == "tool_use" and msg.tool_name in INTERACTIVE_TOOL_NAMES:
+        pass  # Always allow interactive tools through
+    else:
+        is_error = (
+            msg.content_type == "tool_result"
+            and ("Error:" in msg.text or "\u23f9 Interrupted" in msg.text)
+        )
+        if not config.notify.should_notify(msg.content_type, is_error=is_error):
+            logger.debug("Notify filter: skipping %s", msg.content_type)
             return
 
     # Find users whose thread-bound window matches this session
