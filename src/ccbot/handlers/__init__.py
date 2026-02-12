@@ -7,6 +7,7 @@ This package contains the Telegram bot handlers split by functionality:
   - history: Message history pagination
   - directory_browser: Directory selection UI
   - interactive_ui: Interactive UI (AskUserQuestion, Permission Prompt, etc.)
+  - resume: Resume previous Claude Code sessions
   - status_polling: Terminal status line polling
   - response_builder: Build paginated response messages
 """

@@ -74,13 +74,23 @@ class Config:
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = True
 
+        # Notification mode: "all" (default) forwards everything,
+        # "quiet" only forwards text responses, errors, and interactive prompts
+        self.notify_mode = os.getenv("NOTIFY_MODE", "all").lower()
+        if self.notify_mode not in ("all", "quiet"):
+            logger.warning(
+                "Unknown NOTIFY_MODE '%s', falling back to 'all'", self.notify_mode
+            )
+            self.notify_mode = "all"
+
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s",
+            "tmux_session=%s, notify_mode=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
             self.tmux_session_name,
+            self.notify_mode,
         )
 
     def is_user_allowed(self, user_id: int) -> bool:

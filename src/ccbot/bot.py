@@ -114,6 +114,14 @@ from .handlers.message_sender import (
 )
 from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
+from .handlers.resume import (
+    CB_RESUME_CANCEL,
+    CB_RESUME_CONFIRM,
+    CB_RESUME_PAGE,
+    CB_RESUME_SELECT,
+    handle_resume_callback,
+    resume_command,
+)
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
@@ -1078,6 +1086,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "noop":
         await query.answer()
 
+    # Resume session picker
+    elif (
+        data.startswith(CB_RESUME_SELECT)
+        or data.startswith(CB_RESUME_PAGE)
+        or data.startswith(CB_RESUME_CONFIRM)
+        or data == CB_RESUME_CANCEL
+    ):
+        thread_id = _get_thread_id(update)
+        await handle_resume_callback(data, query, user.id, context, thread_id)
+
     # Interactive UI: Up arrow
     elif data.startswith(CB_ASK_UP):
         window_id = data[len(CB_ASK_UP) :]
@@ -1236,12 +1254,38 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
     Messages are queued per-user to ensure status messages always appear last.
     Routes via thread_bindings to deliver to the correct topic.
+
+    In "quiet" notify mode, only forwards:
+      - text responses (what Claude says to the user)
+      - errors and interruptions in tool results
+      - interactive prompts (handled separately before this filter)
     """
     status = "complete" if msg.is_complete else "streaming"
     logger.info(
         f"handle_new_message [{status}]: session={msg.session_id}, "
         f"text_len={len(msg.text)}"
     )
+
+    # Quiet mode filtering — skip noisy intermediate messages.
+    # Interactive prompts (AskUserQuestion, permissions) are handled
+    # separately in the per-user loop below, before this filter applies.
+    if config.notify_mode == "quiet":
+        if msg.content_type == "thinking":
+            logger.debug("Quiet mode: skipping thinking message")
+            return
+        if msg.content_type == "tool_use":
+            # Still allow interactive tools through (handled below)
+            if msg.tool_name not in INTERACTIVE_TOOL_NAMES:
+                logger.debug("Quiet mode: skipping tool_use (%s)", msg.tool_name)
+                return
+        if msg.content_type == "tool_result":
+            # Keep errors and interruptions, skip normal results
+            if "Error:" not in msg.text and "\u23f9 Interrupted" not in msg.text:
+                logger.debug("Quiet mode: skipping tool_result")
+                return
+        if msg.content_type == "local_command":
+            logger.debug("Quiet mode: skipping local_command")
+            return
 
     # Find users whose thread-bound window matches this session
     active_users = await session_manager.find_users_for_session(msg.session_id)
@@ -1326,6 +1370,7 @@ async def post_init(application: Application) -> None:
     bot_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("history", "Message history for this topic"),
+        BotCommand("resume", "Resume a previous conversation"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
@@ -1386,6 +1431,7 @@ def create_bot() -> Application:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
