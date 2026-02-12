@@ -3,9 +3,11 @@
 import pytest
 
 from ccbot.terminal_parser import (
+    ContextInfo,
     extract_bash_output,
     extract_interactive_content,
     is_interactive_ui,
+    parse_context_info,
     parse_status_line,
     strip_pane_chrome,
 )
@@ -45,6 +47,56 @@ class TestParseStatusLine:
 
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
+
+
+# ── parse_context_info ───────────────────────────────────────────────────
+
+
+class TestParseContextInfo:
+    def test_bracket_format(self):
+        """Older format: [Model] Context: NN%"""
+        pane = (
+            "some output\n"
+            "─" * 30 + "\n"
+            "❯\n"
+            "─" * 30 + "\n"
+            "  [Opus 4.6] Context: 34%\n"
+            "  ⏵⏵ bypass permissions…\n"
+        )
+        result = parse_context_info(pane)
+        assert result == ContextInfo(context_percent=34)
+
+    def test_context_left_format(self):
+        """Current format: NN% context left"""
+        pane = "some output\n\n  49% context left\n\n"
+        result = parse_context_info(pane)
+        assert result == ContextInfo(context_percent=49)
+
+    def test_context_left_high(self):
+        pane = "output\n  92% context left\n"
+        result = parse_context_info(pane)
+        assert result == ContextInfo(context_percent=92)
+
+    def test_bracket_format_high(self):
+        pane = "output\n  [Sonnet 4.5] Context: 92%\n"
+        result = parse_context_info(pane)
+        assert result == ContextInfo(context_percent=92)
+
+    def test_zero_percent(self):
+        pane = "output\n  0% context left\n"
+        result = parse_context_info(pane)
+        assert result == ContextInfo(context_percent=0)
+
+    def test_returns_none_when_no_context_line(self):
+        pane = "just normal text\nno context info here\n"
+        assert parse_context_info(pane) is None
+
+    def test_returns_none_for_empty(self):
+        assert parse_context_info("") is None
+
+    def test_with_full_pane(self, sample_pane_status_line: str):
+        # sample_pane_status_line has no context chrome — should return None
+        assert parse_context_info(sample_pane_status_line) is None
 
 
 # ── extract_interactive_content ──────────────────────────────────────────

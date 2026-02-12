@@ -26,7 +26,7 @@ from telegram.error import RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..session import session_manager
-from ..terminal_parser import parse_status_line
+from ..terminal_parser import parse_context_info, parse_status_line
 from ..tmux_manager import tmux_manager
 from .message_sender import NO_LINK_PREVIEW, rate_limit_send_message
 
@@ -499,6 +499,15 @@ async def _check_and_send_status(
     tid = thread_id or 0
     status_line = parse_status_line(pane_text)
     if status_line:
+        # Import cached context from status_polling (avoids duplicate cache)
+        from .status_polling import _context_cache
+
+        ctx = parse_context_info(pane_text)
+        if ctx:
+            _context_cache[window_id] = ctx.context_percent
+        cached_pct = _context_cache.get(window_id)
+        if cached_pct is not None:
+            status_line = f"[{cached_pct}%] {status_line}"
         await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
