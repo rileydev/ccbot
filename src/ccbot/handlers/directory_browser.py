@@ -113,12 +113,16 @@ def build_directory_browser(
     if not path.exists() or not path.is_dir():
         path = Path.cwd()
 
+    # Directories starting with "." are hidden EXCEPT .worktrees (git worktrees)
+    _DOTDIR_ALLOW = frozenset({".worktrees"})
+
     try:
         subdirs = sorted(
             [
                 d.name
                 for d in path.iterdir()
-                if d.is_dir() and not d.name.startswith(".")
+                if d.is_dir()
+                and (not d.name.startswith(".") or d.name in _DOTDIR_ALLOW)
             ]
         )
     except (PermissionError, OSError):
